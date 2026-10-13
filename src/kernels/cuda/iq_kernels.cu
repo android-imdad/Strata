@@ -7,6 +7,14 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#include "strata/kernels/sexp.hpp"
+// The routed experts' SwiGLU exponential: __expf, or with -DSTRATA_SWIGLU_SEXP the portable sexp (a CPU can compute it
+// bit for bit; ~1 ulp where __expf is up to ~64)
+#ifdef STRATA_SWIGLU_SEXP
+#define STRATA_SWIGLU_EXP(x) strata::kernels::sexp(x)
+#else
+#define STRATA_SWIGLU_EXP(x) __expf(x)
+#endif
 #include "s26_tsum.cuh"
 
 #include <cuda_fp16.h>
@@ -1332,7 +1340,7 @@ __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const floa
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    h[i] = (g / (1.0f + STRATA_SWIGLU_EXP(-g))) * up[i];
 }
 
 template<int TD>
@@ -1548,9 +1556,9 @@ __device__ __forceinline__ void swiglu_q8_1_one(const float* __restrict__ gate, 
 #endif
     const float g = gate[i];
 #if defined(__HIPCC__)
-    const float h = (g / (1.0f + __expf(-g))) * up[i];
+    const float h = (g / (1.0f + STRATA_SWIGLU_EXP(-g))) * up[i];
 #else
-    const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+    const float h = __fmul_rn(g / (1.0f + STRATA_SWIGLU_EXP(-g)), up[i]);
 #endif
     q8_1_store(h, y, iy);
 }
@@ -1593,9 +1601,9 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
          i += (long long) gridDim.x * blockDim.x) {
         const float g = gate[i];
 #if defined(__HIPCC__)
-        const float h = (g / (1.0f + __expf(-g))) * up[i];
+        const float h = (g / (1.0f + STRATA_SWIGLU_EXP(-g))) * up[i];
 #else
-        const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+        const float h = __fmul_rn(g / (1.0f + STRATA_SWIGLU_EXP(-g)), up[i]);
 #endif
         q8_1_store(h, hq, i);
     }
@@ -2364,7 +2372,7 @@ __global__ void s26_swiglu_q8_1_kernel(const float* __restrict__ gate, const flo
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n is a multiple of 32: whole warps only
     const float g = gate[i];
-    const float xi = (g / (1.0f + __expf(-g))) * up[i];
+    const float xi = (g / (1.0f + STRATA_SWIGLU_EXP(-g))) * up[i];
     h[i] = xi;
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
@@ -3451,7 +3459,7 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
         __syncthreads();
         if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
             const float gg = res[warp][lane], uu = res[warp][32 + lane];
-            const float xi = (gg / (1.0f + __expf(-gg))) * uu;
+            const float xi = (gg / (1.0f + STRATA_SWIGLU_EXP(-gg))) * uu;
             float amax = fabsf(xi), sum = xi;
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) {

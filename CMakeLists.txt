@@ -1496,6 +1496,13 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_expert_bench src/kernels/native_expert_bench.cpp)
     target_include_directories(native_expert_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(native_expert_bench PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
+    # prototype: CPU replica of the GPU expert arithmetic (CPU/GPU parity), bit for bit against native_expert_grouped
+    add_executable(expert_replica src/kernels/expert_replica.cpp src/kernels/cpu/replica_avx512.cpp)
+    set_source_files_properties(src/kernels/expert_replica.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    set_source_files_properties(src/kernels/cpu/replica_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma;-ffp-contract=off")
+    target_include_directories(expert_replica PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    target_link_libraries(expert_replica PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
     if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
       # Unsloth UD-Q4_K_XL's three expert pairs (and Q8_0 alone, its embedding) on synthetic ggml-quantized weights
       # at 2560/640: GPU and CPU experts against the float reference, GPU dequantizers against to_float.
