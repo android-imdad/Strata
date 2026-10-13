@@ -1165,7 +1165,8 @@ bool gu_exact_check(Gemm& gemm, uint16_t* scratch, int64_t scratch_elems, void* 
     (void) cudaGetLastError();
     if (why) std::fprintf(stderr, "strata prefill: STRATA_PF_GU_EXACT off: %s\n", why);
     else std::fprintf(stderr, "strata prefill: STRATA_PF_GU_EXACT: the experts' gate/up products from 2 tokens, %d experts a launch "
-                              "(checked bit for bit against rocBLAS at %d token counts)\n", gu_exact_group(), NE);
+                              "(checked bit for bit against rocBLAS at %d token counts)%s\n", gu_exact_group(), NE,
+                              gu_exact_tensile() ? "; from 65 tokens on the Tensile kernel" : "");
     return same && !why;
 }
 }  // namespace

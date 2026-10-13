@@ -10,6 +10,9 @@
 //   and the result is (p0 + p1) + p2.
 // (1 token: a GEMV, left to rocBLAS.)  These kernels compute the same chains for every output of a group of experts, so
 // the products are the same bits (checked against Gemm::f16 at start-up; any difference turns them off).
+// On gfx1100 the >= 65-token experts run on a Tensile-generated kernel instead (gu_tensile_gfx1100.s: the same
+// order, MacroTile 64x128, ~2x the fallback's speed), one launch per expert over 8 streams; STRATA_PF_GU_TENSILE=0
+// keeps them on gu_exact's own kernel.
 #pragma once
 
 #include <cstdint>
@@ -36,5 +39,8 @@ struct GuExactGroup {
 /// Y_e = X_e . W_e^T for every expert of the group: one launch for the experts from 65 tokens, one plus a reduction for
 /// those below (`ws`: kGuExactWsFloats floats).  HIP; false elsewhere or on a launch error.
 bool gu_exact_run(GuExactGroup& g, float* ws, void* stream);
+
+/// True when this device runs the >= 65-token experts on the Tensile kernel (gfx1100, loaded, not turned off).
+bool gu_exact_tensile();
 
 }  // namespace strata::prefill

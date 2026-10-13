@@ -4,6 +4,9 @@
 #if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace strata::prefill {
 namespace {
@@ -208,6 +211,97 @@ __global__ void gu_exact_reduce(const GuExactGroup g, const float* __restrict__ 
 }
 }  // namespace
 
+// ---- the Tensile kernel (gu_tensile_gfx1100.s, gfx1100 only) for the chains from 65 tokens, several experts at once.
+// The same per-output FMA order as rocBLAS's MT64x32x8 fallback (MT0 64, GSU 1, StaggerU 32 / 256 bytes / mapping 0,
+// InnerUnroll 1), about twice its speed; one launch per expert, the group's experts spread over kStreams streams
+// forked from and joined to the caller's (a single expert of ~100-300 tokens cannot fill the card).
+#include "gu_tensile_gfx1100.inc"
+namespace {
+constexpr int kStreams = 8;
+struct __attribute__((packed)) TensileArgs {   // the kernel's kernarg segment (128 bytes, its metadata's order)
+    uint64_t size_a, size_b;
+    float *d, *c;
+    const void *a, *b;
+    float alpha, beta;
+    uint32_t stride_d[2], stride_c[2], stride_a[2], stride_b[2];
+    uint32_t size0, size1, size2, size_l;
+    int32_t stagger_u_iter;
+    uint32_t nwg0, nwg1, num_full_blocks, wgm_rem1, magic_wgm_rem1;
+};
+static_assert(sizeof(TensileArgs) == 128, "Tensile kernarg layout");
+struct TensileState {
+    bool tried = false, ok = false;
+    hipModule_t mod = nullptr;
+    hipFunction_t fn = nullptr;
+    hipStream_t st[kStreams] = {};
+    hipEvent_t fork = nullptr, join[kStreams] = {};
+};
+TensileState g_tensile[16];   // per device
+
+TensileState* tensile_state() {
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return nullptr;
+    TensileState& t = g_tensile[dev];
+    if (t.tried) return t.ok ? &t : nullptr;
+    t.tried = true;
+    static const bool off = [] { const char* v = std::getenv("STRATA_PF_GU_TENSILE"); return v && v[0] == '0'; }();
+    hipDeviceProp_t p;
+    if (off || hipGetDeviceProperties(&p, dev) != hipSuccess || std::strncmp(p.gcnArchName, "gfx1100", 7) != 0 ||
+        (p.gcnArchName[7] != 0 && p.gcnArchName[7] != ':'))
+        return nullptr;
+    if (hipModuleLoadData(&t.mod, kGuTensileCo) != hipSuccess ||
+        hipModuleGetFunction(&t.fn, t.mod, "Cijk_Alik_Bljk_HSS_BH_MT64x128x32_SN_GLVWA4_K1_PGR1_WGM8") != hipSuccess) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    bool ok = hipEventCreateWithFlags(&t.fork, hipEventDisableTiming) == hipSuccess;
+    for (int i = 0; ok && i < kStreams; ++i)
+        ok = hipStreamCreateWithFlags(&t.st[i], hipStreamNonBlocking) == hipSuccess &&
+             hipEventCreateWithFlags(&t.join[i], hipEventDisableTiming) == hipSuccess;
+    if (!ok) { (void) hipGetLastError(); return nullptr; }
+    t.ok = true;
+    return &t;
+}
+
+// one expert: Y[T, 1280] = X[T, 2560] . W[1280, 2560]^T with Tensile's arguments (ContractionSolution::solve's values)
+bool tensile_launch(const TensileState& t, const uint16_t* x, const uint16_t* w, float* y, int T, hipStream_t st) {
+    constexpr int MT0 = 64, MT1 = 128, DU = 32, WGM = 8;
+    TensileArgs a{};
+    a.size_a = (uint64_t) kN * kK;
+    a.size_b = (uint64_t) T * kK;
+    a.d = y;
+    a.c = y;
+    a.a = w;
+    a.b = x;
+    a.alpha = 1.f;
+    a.beta = 0.f;
+    a.stride_d[0] = a.stride_c[0] = kN;
+    a.stride_d[1] = a.stride_c[1] = (uint32_t) kN * T;
+    a.stride_a[0] = kK;
+    a.stride_a[1] = (uint32_t) kN * kK;
+    a.stride_b[0] = kK;
+    a.stride_b[1] = (uint32_t) T * kK;
+    a.size0 = kN;
+    a.size1 = T;
+    a.size2 = 1;
+    a.size_l = kK;
+    unsigned su = 32;   // staggerUIter: StaggerU 32 stepped down while the k loop is too short; stride 256 bytes
+    const unsigned iters = kK / DU, shifted = 256 / (DU * 2);
+    while (su > 1 && iters < su * shifted) su /= 2;
+    a.stagger_u_iter = (int32_t) su - 1;
+    a.nwg0 = (kN + MT0 - 1) / MT0;
+    a.nwg1 = (T + MT1 - 1) / MT1;
+    a.num_full_blocks = a.nwg1 / WGM;
+    a.wgm_rem1 = a.nwg1 % WGM ? a.nwg1 % WGM : WGM;
+    a.magic_wgm_rem1 = (uint32_t) ((1ull << 31) / a.wgm_rem1 + 1);
+    size_t bytes = sizeof a;
+    void* cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &a, HIP_LAUNCH_PARAM_BUFFER_SIZE, &bytes, HIP_LAUNCH_PARAM_END};
+    return hipModuleLaunchKernel(t.fn, a.nwg0, a.nwg1, 1, 256, 1, 1, 0, st, nullptr, cfg) == hipSuccess;
+}
+}  // namespace
+
+bool gu_exact_tensile() { return tensile_state() != nullptr; }
+
 bool gu_exact_run(GuExactGroup& g, float* ws, void* stream) {
     if (g.n <= 0 || g.n > kGuExactMax) return false;
     // two sub-groups: the chains (>= 65 tokens) and the 3-split chains (2..64), each a group of its own
@@ -221,7 +315,16 @@ bool gu_exact_run(GuExactGroup& g, float* ws, void* stream) {
         ++d.n;
     }
     const hipStream_t st = (hipStream_t) stream;
-    if (big.n > 0) {
+    const TensileState* ts = big.n > 0 ? tensile_state() : nullptr;
+    if (ts) {   // fork, one launch per expert round-robin over the streams, join
+        bool ok = hipEventRecord(ts->fork, st) == hipSuccess;
+        const int ns = big.n < kStreams ? big.n : kStreams;
+        for (int i = 0; ok && i < ns; ++i) ok = hipStreamWaitEvent(ts->st[i], ts->fork, 0) == hipSuccess;
+        for (int e = 0; ok && e < big.n; ++e) ok = tensile_launch(*ts, big.x[e], big.w[e], big.y[e], big.t[e], ts->st[e % ns]);
+        for (int i = 0; i < ns; ++i)
+            if (hipEventRecord(ts->join[i], ts->st[i]) != hipSuccess || hipStreamWaitEvent(st, ts->join[i], 0) != hipSuccess) ok = false;
+        if (!ok) return false;
+    } else if (big.n > 0) {
         constexpr int BN = 64, BT = 64, TN = 8, TT = 4, DU = 32;
         big.b0[0] = 0;
         for (int e = 0; e < big.n; ++e) big.b0[e + 1] = big.b0[e] + (big.t[e] + BT - 1) / BT;
@@ -253,6 +356,7 @@ bool gu_exact_run(GuExactGroup& g, float* ws, void* stream) {
 
 namespace strata::prefill {
 bool gu_exact_run(GuExactGroup&, float*, void*) { return false; }
+bool gu_exact_tensile() { return false; }
 }  // namespace strata::prefill
 
 #endif
