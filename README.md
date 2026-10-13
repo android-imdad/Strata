@@ -32,7 +32,9 @@ Linux, ROCm 10.2, IQ3_S, every output-changing switch off):
 
 How: faster decode kernels ([PR #2231](https://github.com/Niko1221/Strata/pull/2231)), and the prompt's expert
 products computed in exactly rocBLAS's summation order, but grouped and on a Tensile-generated kernel for this card
-(`STRATA_PF_GU_EXACT=1`), about 2x faster for that step. Details, flags and how it was checked:
+(`STRATA_PF_GU_EXACT=1`), about 2x faster for that step. With `STRATA_IQ_MT_MIN=1` decode is also **deterministic**:
+every token equals one-token-at-a-time decoding whatever the drafter guesses, so faster draft policies (prompt lookup
+for code rewrites, +8%) change only the speed. Details, flags and how it was checked:
 **[docs/RX7900XTX.md](docs/RX7900XTX.md)**.
 
 ## How fast is it?

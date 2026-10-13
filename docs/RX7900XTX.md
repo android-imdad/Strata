@@ -74,6 +74,29 @@ How it was checked:
 - In the engine: kl.py (2,557 positions after 16K / 16K / 64K prompt reads) KL 0.0000, 100% same top token; the
   session-state fingerprint after short prompts identical.
 
+### 3. Deterministic decode: the same tokens whatever the drafter does (`STRATA_IQ_MT_MIN=1`)
+
+Strata verifies the drafter's guesses in windows of 1-8 tokens, and the window a token lands in follows the drafts, which
+follow measured timings. Without this switch a token's logits depend on its window: reading the same text through windows
+of 2, 3 or 4 tokens instead of 1 gives KL 0.010-0.015 (max 8 at single positions), so the same prompt can give a slightly
+different reply from run to run. The cause on this card is the CPU expert rows, which were grouped by window.
+
+Upstream's `STRATA_IQ_MT_MIN=1` computes every CPU row independently of the window. With it, teacher-forced reading
+through windows of **1, 2, 3, 4, 5, 6 and 8 tokens gives byte-identical log-probabilities** (2,557 positions, KL 0.0000,
+the same 36 GDN layer states), so every token is exactly what one-token-at-a-time decoding would give, and the reply is
+the same every run. Checked with the debug knob `STRATA_READ_WINDOW=N` (read through windows of at most N tokens) and
+`kl.py`; end to end, a 2,425-token file rewrite returned byte-identical replies under four draft policies.
+
+That makes the draft policy a pure speed setting. On rewrite turns (the model returns a file with small edits):
+
+| Draft policy (all with `STRATA_IQ_MT_MIN=1`) | Decode, 2,425-token rewrite |
+| --- | ---: |
+| `--spec-min-p 0.70`, no lookup | 134 tokens/s (median of 3) |
+| `--spec-min-p 0.5 --lookup-chain 3` | 145 tokens/s (median of 3), same bytes |
+
+Ordinary chat and agent turns are unchanged by the policy (within noise); `STRATA_IQ_MT_MIN` itself costs 0-5% there.
+The reference this matches is one-token decoding, not the engine without the switch (whose replies follow the drafts).
+
 ## Use it
 
 Build the HIP engine for gfx1100 (the interleaved-copy path needs `-DSTRATA_HIP_MMVQ_IL`):
@@ -89,8 +112,11 @@ Then add to the `env` of your `strata-*.json` (all bit-exact):
 ```json
 "STRATA_PF_GU_EXACT": "1",
 "STRATA_WAIT_FUSE": "1", "STRATA_MMVQ_IL_PLAIN": "1", "STRATA_COMBINE_HITS": "1", "STRATA_ROUTE_PUB": "1",
-"STRATA_WAIT_COMBINE": "1", "STRATA_PF_LEAN_ISSUE": "1", "STRATA_PF_COPY2": "1", "STRATA_IO_THREADS": "64"
+"STRATA_WAIT_COMBINE": "1", "STRATA_PF_LEAN_ISSUE": "1", "STRATA_PF_COPY2": "1", "STRATA_IO_THREADS": "64",
+"STRATA_IQ_MT_MIN": "1"
 ```
+
+and, for deterministic decode with faster rewrite turns, to its `args`: `--spec-min-p 0.5 --lookup-chain 3`.
 
 The log says whether it is on:
 
