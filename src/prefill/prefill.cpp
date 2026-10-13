@@ -313,7 +313,7 @@ constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + do
 // launch (gu_exact.hpp: rocBLAS's own summation order, the same bits); each keeps its own dequantized buffers until
 // then, so the ring gains G entries.  0 = off: every call as before.
 inline int gu_exact_group() {
-#if defined(__HIPCC__)
+#if defined(STRATA_USE_HIP)
     static const int g = [] {
         const char* v = std::getenv("STRATA_PF_GU_EXACT");
         const int n = v ? std::atoi(v) : 0;
