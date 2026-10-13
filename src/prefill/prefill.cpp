@@ -856,6 +856,7 @@ struct Prefill::Impl {
     uint16_t* dq_gu[DQ_MAX] = {};
     uint16_t* dq_d[DQ_MAX] = {};
     bool gu_exact_ok = false;   // STRATA_PF_GU_EXACT passed its start-up check against Gemm::f16
+    float* gu_exact_ws = nullptr;   // ... its 3-split partials (experts below 65 tokens)
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
@@ -1096,22 +1097,28 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
 namespace {
 // STRATA_PF_GU_EXACT's start-up check: random experts at token counts across its range, one grouped launch against
 // Gemm::f16 (the call it stands in for, on this engine's handle and settings) bit for bit.  A difference, a count that
-// would not reach rocBLAS, or no room for the test buffers keeps it off.
-bool gu_exact_check(Gemm& gemm, int device, cudaStream_t stream) {
+// would not reach rocBLAS, or no room for the test buffers keeps it off.  The GEMM's own scratch and workspace are cache
+// slots the prompt path borrows only while it reads a prompt (at init they still hold experts), and rocBLAS's split-K
+// kernel writes its partials into the workspace: the check runs on private ones and gives the borrowed ones back.
+bool gu_exact_check(Gemm& gemm, uint16_t* scratch, int64_t scratch_elems, void* gemm_ws, size_t gemm_ws_bytes, int device,
+                    cudaStream_t stream) {
     const core::OnDevice on(device);
-    static const int Ts[] = {65, 66, 96, 127, 128, 129, 200, 255, 333, 512, 777, 1024, 2047, 4100};
+    static const int Ts[] = {2, 3, 5, 8, 17, 31, 32, 33, 47, 63, 64, 65, 66, 96, 127, 128, 129, 200, 255, 333, 512, 777, 1024, 2047, 4100};
     constexpr int NE = (int) (sizeof Ts / sizeof Ts[0]);
     const char* why = nullptr;
     for (int T : Ts)
         if (!gemm.f16_on_rocblas(T, 1280, 2560)) why = "the product does not run on rocBLAS here (another GEMM path is chosen)";
     int64_t rows = 0;
     for (int T : Ts) rows += T;
-    uint16_t *x = nullptr, *w = nullptr;
-    float *y = nullptr, *r = nullptr;
+    uint16_t *x = nullptr, *w = nullptr, *pscratch = nullptr;
+    float *y = nullptr, *r = nullptr, *ws = nullptr;
+    void* pws = nullptr;
     const size_t xb = (size_t) rows * 2560 * 2, wb = (size_t) 2 * 1280 * 2560 * 2, yb = (size_t) rows * 1280 * 4;
     if (!why && (cudaMalloc(&x, xb) != cudaSuccess || cudaMalloc(&w, wb) != cudaSuccess || cudaMalloc(&y, yb) != cudaSuccess ||
-                 cudaMalloc(&r, yb) != cudaSuccess))
+                 cudaMalloc(&r, yb) != cudaSuccess || cudaMalloc(&ws, (size_t) kGuExactWsFloats * 4) != cudaSuccess ||
+                 cudaMalloc(&pscratch, (size_t) scratch_elems * 2) != cudaSuccess || cudaMalloc(&pws, gemm_ws_bytes) != cudaSuccess))
         why = "no room for the check's buffers";
+    if (!why) gemm.rebind(pscratch, scratch_elems, pws, gemm_ws_bytes);
     bool same = false;
     if (!why) {
         // random FP16 bits: activations around 2^-6..2^0, weights around 2^-10..2^-3, both signs (no inf / NaN)
@@ -1139,7 +1146,7 @@ bool gu_exact_check(Gemm& gemm, int device, cudaStream_t stream) {
             o += Ts[e];
         }
         g.n = NE;
-        if (!gu_exact_run(g, stream)) why = "the launch failed";
+        if (!gu_exact_run(g, ws, stream)) why = "the launch failed";
         cudaStreamSynchronize(stream);
         if (!why) {
             std::vector<float> a((size_t) rows * 1280), b(a.size());
@@ -1149,11 +1156,15 @@ bool gu_exact_check(Gemm& gemm, int device, cudaStream_t stream) {
             if (!same) why = "its products differ from rocBLAS's here (another library build?)";
         }
     }
-    for (void* p : {(void*) x, (void*) w, (void*) y, (void*) r})
+    if (pws) {
+        cudaStreamSynchronize(stream);
+        gemm.rebind(scratch, scratch_elems, gemm_ws, gemm_ws_bytes);
+    }
+    for (void* p : {(void*) x, (void*) w, (void*) y, (void*) r, (void*) ws, (void*) pscratch, pws})
         if (p) cudaFree(p);
     (void) cudaGetLastError();
     if (why) std::fprintf(stderr, "strata prefill: STRATA_PF_GU_EXACT off: %s\n", why);
-    else std::fprintf(stderr, "strata prefill: STRATA_PF_GU_EXACT: the experts' gate/up products from 65 tokens, %d experts a launch "
+    else std::fprintf(stderr, "strata prefill: STRATA_PF_GU_EXACT: the experts' gate/up products from 2 tokens, %d experts a launch "
                               "(checked bit for bit against rocBLAS at %d token counts)\n", gu_exact_group(), NE);
     return same && !why;
 }
@@ -1305,8 +1316,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.f16_io = prompt_f16();
         m.gemm.set_f16_io(m.f16_io);
         set_act_f16(m.f16_io);
+        if (gu_exact_group() > 0 && !m.gu_exact_ok)
+            m.gu_exact_ok = gu_exact_check(m.gemm, gs, GEMM_SCRATCH, ws, GEMM_WS, m.device, (cudaStream_t) stream);
     }
-    if (gu_exact_group() > 0 && !m.gu_exact_ok) m.gu_exact_ok = gu_exact_check(m.gemm, m.device, (cudaStream_t) stream);
     if (!carve(T, &o)) {
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
@@ -1387,6 +1399,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (base == nullptr) ok = false;
     }
     for (int i = 0; i < DQ + gu_exact_group(); ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+    m.gu_exact_ws = gu_exact_group() > 0 ? o.take<float>((size_t) 3 * gu_exact_group() * 64 * 1280, ok) : nullptr;
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
@@ -1985,6 +1998,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
     for (int i = 0; i < DQ + gu_exact_group(); ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+    if (gu_exact_group() > 0) o.take<float>((size_t) 3 * gu_exact_group() * 64 * 1280, ok);
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
@@ -3970,7 +3984,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         auto gx_flush = [&]() {
                             if (gx.n == 0) return;
                             pt.mark(kPfGemmGU, cs);
-                            if (!gu_exact_run(gx, m.cs))   // (a failed launch: the same products, one call each)
+                            if (!gu_exact_run(gx, m.gu_exact_ws, m.cs))   // (a failed launch: the same products, one call each)
                                 for (int i = 0; i < gx.n; ++i) m.gemm.f16(gx.x[i], gx.w[i], gx.y[i], gx.t[i], 1280, N);
                             for (int i = 0; i < gx.n; ++i) {
                                 const int64_t o0 = gx_o0[i], ne = gx.t[i];
@@ -4029,7 +4043,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return true;
                             }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
-                            const bool defer = m.gu_exact_ok && N == 2560 && ne >= kGuExactMinT && ne <= kGuExactMaxT &&
+                            static const int64_t gx_min = [] { const char* v = std::getenv("STRATA_PF_GU_EXACT_MINT"); return v ? (int64_t) std::atoll(v) : kGuExactMinT; }();   // (debug)
+                            const bool defer = m.gu_exact_ok && N == 2560 && ne >= std::max(gx_min, kGuExactMinT) && ne <= kGuExactMaxT &&
                                                m.gemm.f16_on_rocblas(ne, 1280, N);
                             const int q = defer ? DQ + gx.n : (int) (j % DQ);
                             if (lay.native) {
