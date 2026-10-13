@@ -1,10 +1,11 @@
-// src/kernels/cpu/replica_avx512.cpp - prototype: the GPU expert arithmetic in AVX-512 (CPU/GPU parity).
+// src/kernels/cpu/replica_avx512.cpp - STRATA_CPU_PARITY: the GPU's native expert arithmetic in AVX-512.
 //
-// The same values as the GPU's native_expert_grouped, bit for bit (expert_replica checks it against the GPU and
-// times it against iq_avx512.cpp / iq_avx2.cpp): q8_1 activations, each 32-value part's integer dot and the format's
-// integer scale step, (dw * d8) * sumi accumulated by fma in row_dot_80_sub16's / row_dot_40_sub8's lanes and order,
-// then their butterfly.  The weight decode is iq_avx512.cpp's (grid magnitudes, a sign mask per byte).
-#include "replica_avx512.hpp"
+// The same values as the GPU's native_expert_grouped, bit for bit (expert_replica checks it against the GPU on every
+// layer): q8_1 activations, each 32-value part's integer dot and the format's integer scale step, (dw * d8) * sumi
+// accumulated by fma in row_dot_80_sub16's / row_dot_40_sub8's / row_dot_20_sub16's lanes and order, then their
+// butterfly; the SwiGLU with sexp.  The i-quant weight decode is iq_avx512.cpp's (grid magnitudes, a sign mask per
+// byte).  Gate/up IQ3_XXS, IQ3_S, IQ2_S, IQ4_XS; down IQ4_NL, Q2_0; n_embd 2560, n_ff 640.
+#include "strata/kernels/cpu/replica_avx512.hpp"
 #include "strata/kernels/sexp.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -73,6 +74,22 @@ template <> struct Dec<22> {   // IQ2_S
     static inline int ls1(const uint8_t* b, int sb) { return b[74 + sb] >> 4; }
 };
 
+template <> struct Dec<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] (sub-block sb: qs[16 sb ..], low nibbles first)
+    static constexpr int bytes = 136;
+    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m) {
+        const __m128i tbl = _mm_loadu_si128((const __m128i*) kvalues_iq4nl), mk = _mm_set1_epi8(0x0F);
+        const __m128i q0 = _mm_loadu_si128((const __m128i*) (b + 8 + 32 * j)), q1 = _mm_loadu_si128((const __m128i*) (b + 8 + 32 * j + 16));
+        const __m128i l0 = _mm_shuffle_epi8(tbl, _mm_and_si128(q0, mk)), h0 = _mm_shuffle_epi8(tbl, _mm_and_si128(_mm_srli_epi16(q0, 4), mk));
+        const __m128i l1 = _mm_shuffle_epi8(tbl, _mm_and_si128(q1, mk)), h1 = _mm_shuffle_epi8(tbl, _mm_and_si128(_mm_srli_epi16(q1, 4), mk));
+        const __m512i w = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set_m128i(h0, l0)), _mm256_set_m128i(h1, l1), 1);
+        m = _mm512_movepi8_mask(w);
+        g = _mm512_abs_epi8(w);
+    }
+    static inline int ls(const uint8_t* b, int sb) {
+        return (((b[4 + sb / 2] >> (4 * (sb % 2))) & 0x0F) | (((u16(b + 2) >> (2 * sb)) & 3) << 4)) - 32;
+    }
+};
+
 // C's truncating division by 2 and 4 (the GPU's int `/`)
 inline __m512i div2(__m512i v) { return _mm512_srai_epi32(_mm512_add_epi32(v, _mm512_srli_epi32(v, 31)), 1); }
 inline __m512i div4(__m512i v) { return _mm512_srai_epi32(_mm512_add_epi32(v, _mm512_srli_epi32(_mm512_srai_epi32(v, 31), 30)), 2); }
@@ -116,7 +133,7 @@ inline __m512i reduce4(__m512i a0, __m512i a1, __m512i a2, __m512i a3) {
 
 // one gate or up row (n_embd 2560: 10 blocks, 80 parts) against NT tokens
 template <int TY, int NT>
-inline void row80(const uint8_t* row, const Act* const* y, float* res) {
+inline void row80(const uint8_t* row, const ActX* const* y, float* res) {
     constexpr int NB = 10;
     __m512i H[NT][NB];   // per token: the 16 half-part sums of each block
     const __m512i zero = _mm512_setzero_si512();
@@ -151,6 +168,10 @@ inline void row80(const uint8_t* row, const Act* const* y, float* res) {
                                                                    _mm512_set_epi32(4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0)),
                                                  _mm512_set1_epi32(15));
             LA[q] = _mm512_add_epi32(_mm512_add_epi32(nib, nib), _mm512_set1_epi32(1));
+        } else if constexpr (TY == 23) {   // ls - 32 (6-bit scales; one layer of the model)
+            alignas(64) int l[16];
+            for (int sb = 0; sb < 8; ++sb) { l[sb] = Dec<23>::ls(b0, sb); l[8 + sb] = Dec<23>::ls(b1, sb); }
+            LA[q] = _mm512_load_si512(l);
         } else if constexpr (TY == 18) {   // the top nibble of each of the 8 aux words at 66
             LA[q] = _mm512_srli_epi32(_mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*) (b0 + 66))),
                                                          _mm256_loadu_si256((const __m256i*) (b1 + 66)), 1), 28);
@@ -173,7 +194,7 @@ inline void row80(const uint8_t* row, const Act* const* y, float* res) {
             } else if constexpr (TY == 18) {   // (ls * s + s / 2) / 2
                 const __m512i sm = _mm512_add_epi32(h0, h1);
                 si = div2(_mm512_add_epi32(_mm512_mullo_epi32(LA[q], sm), div2(sm)));
-            } else {   // IQ3_S: s * ls
+            } else {   // IQ3_S: s * ls, IQ4_XS: s * (ls - 32)
                 si = _mm512_mullo_epi32(_mm512_add_epi32(h0, h1), LA[q]);
             }
             D[q] = _mm512_mul_ps(DW[q], _mm512_loadu_ps(y[t]->d8 + 16 * q));
@@ -190,7 +211,7 @@ inline void row80(const uint8_t* row, const Act* const* y, float* res) {
 }
 
 template <int TY, int NT>
-void gu_rows_t(const uint8_t* blob, size_t gu_row, size_t up_off, const Act* const* act, float* const* hout, int r0, int r1) {
+void gu_rows_t(const uint8_t* blob, size_t gu_row, size_t up_off, const ActX* const* act, float* const* hout, int r0, int r1) {
     float g[NT], u[NT];
     for (int r = r0; r < r1; ++r) {
         row80<TY, NT>(blob + (size_t) r * gu_row, act, g);
@@ -199,7 +220,7 @@ void gu_rows_t(const uint8_t* blob, size_t gu_row, size_t up_off, const Act* con
     }
 }
 template <int TY>
-void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, const Act* const* act, float* const* h, int r0, int r1) {
+void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, const ActX* const* act, float* const* h, int r0, int r1) {
     for (int t0 = 0; t0 < nt; t0 += 4) {
         const int k = nt - t0 < 4 ? nt - t0 : 4;
         switch (k) {
@@ -225,7 +246,7 @@ inline __m512i iq4nl_pair(const uint8_t* b0) {   // two blocks' 64 values as int
 }
 
 template <int NT>
-inline void row40(const uint8_t* row, const Act* const* y, float* res) {
+inline void row40(const uint8_t* row, const ActH* const* y, float* res) {
     // per pair: 128-bit lane p = part 4 pr + p (4-value partial sums); four pairs reduce to one vector of 16 parts
     __m512i V[NT][12];
     for (int pr = 0; pr < 10; ++pr) {
@@ -233,7 +254,7 @@ inline void row40(const uint8_t* row, const Act* const* y, float* res) {
         const __mmask64 neg = _mm512_movepi8_mask(w);
         const __m512i wa = _mm512_abs_epi8(w);
         for (int t = 0; t < NT; ++t) {
-            const __m512i yv = _mm512_loadu_si512((const void*) (y[t]->qp + 64 * pr));
+            const __m512i yv = _mm512_loadu_si512((const void*) (y[t]->q + 64 * pr));
             const __m512i ys = _mm512_mask_sub_epi8(yv, neg, _mm512_setzero_si512(), yv);
             V[t][pr] = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wa, ys);
         }
@@ -261,7 +282,7 @@ inline void row40(const uint8_t* row, const Act* const* y, float* res) {
             _mm512_store_si512(si + 16 * g, _mm512_permutexvar_epi32(tr, reduce4(V[t][4 * g], V[t][4 * g + 1], V[t][4 * g + 2], V[t][4 * g + 3])));
         __m256 D[5], S[5];
         for (int q = 0; q < 5; ++q) {
-            D[q] = _mm256_mul_ps(_mm256_load_ps(dw + 8 * q), _mm256_loadu_ps(y[t]->d8x2 + 8 * q));
+            D[q] = _mm256_mul_ps(_mm256_load_ps(dw + 8 * q), _mm256_loadu_ps(y[t]->d + 8 * q));
             S[q] = _mm256_cvtepi32_ps(_mm256_load_si256((const __m256i*) (si + 8 * q)));
         }
         const __m256 z = _mm256_setzero_ps();
@@ -273,7 +294,7 @@ inline void row40(const uint8_t* row, const Act* const* y, float* res) {
     }
 }
 template <int NT>
-void down_t(const uint8_t* w, size_t row_bytes, const Act* const* h, float* const* out, int r0, int r1) {
+void down_t(const uint8_t* w, size_t row_bytes, const ActH* const* h, float* const* out, int r0, int r1) {
     float res[NT];
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
@@ -284,70 +305,151 @@ void down_t(const uint8_t* w, size_t row_bytes, const Act* const* h, float* cons
     }
 }
 
-}  // namespace
 
-void quant(const float* x, int n, Act& a) {
-    const __m512 absm = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
-    for (int b = 0; b < n / 32; ++b) {
-        const __m512 v0 = _mm512_loadu_ps(x + 32 * b), v1 = _mm512_loadu_ps(x + 32 * b + 16);
-        // amax (a max, any order), sum: the warp's butterfly - xor 16 is v0 + v1, then 8, 4, 2, 1 over 16 lanes
-        const float am = _mm512_reduce_max_ps(_mm512_max_ps(_mm512_and_ps(v0, absm), _mm512_and_ps(v1, absm)));
-        __m512 sm = _mm512_add_ps(v0, v1);
-        sm = _mm512_add_ps(sm, _mm512_shuffle_f32x4(sm, sm, 0x4E));
-        sm = _mm512_add_ps(sm, _mm512_shuffle_f32x4(sm, sm, 0xB1));
-        sm = _mm512_add_ps(sm, _mm512_permute_ps(sm, 0x4E));
-        sm = _mm512_add_ps(sm, _mm512_permute_ps(sm, 0xB1));
-        (void) sm;   // the block sum (ds.y) is not read by these formats' dots
-        float d = am / 127.0f;
-        if (std::fabs(d) > 65504.0f) d = std::copysign(65504.0f, d);
-        __m128i q8;
-        if (am == 0.0f) {
-            q8 = _mm_setzero_si128();
-            _mm_storeu_si128((__m128i*) (a.qs + 32 * b), q8);
-            _mm_storeu_si128((__m128i*) (a.qs + 32 * b + 16), q8);
-        } else {
-            const __m512 dv = _mm512_set1_ps(d);
-            for (int h = 0; h < 2; ++h) {
-                const __m512 t = _mm512_div_ps(h ? v1 : v0, dv);
-                // roundf: half away from zero.  t - trunc(t) is exact; |frac| >= 0.5 rounds away
-                const __m512 tr = _mm512_roundscale_ps(t, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
-                const __m512 fr = _mm512_and_ps(_mm512_sub_ps(t, tr), absm);
-                const __mmask16 up = _mm512_cmp_ps_mask(fr, _mm512_set1_ps(0.5f), _CMP_GE_OQ);
-                const __m512 one = _mm512_or_ps(_mm512_set1_ps(1.0f), _mm512_andnot_ps(absm, t));   // copysign(1, t)
-                __m512 r = _mm512_mask_add_ps(tr, up, tr, one);
-                r = _mm512_min_ps(_mm512_max_ps(r, _mm512_set1_ps(-127.0f)), _mm512_set1_ps(127.0f));
-                _mm_storeu_si128((__m128i*) (a.qs + 32 * b + 16 * h), _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(r)));
-            }
+// ---- Q2_0 down rows (n_ff 640: 10 blocks of 64, 20 parts of 32 values = the h q8_1 blocks)
+// one block's 64 two-bit codes (0..3; the weight is code - 1) in value order
+inline __m512i q2_codes(const uint8_t* blk) {
+    const __m128i q = _mm_loadu_si128((const __m128i*) (blk + 2)), m3 = _mm_set1_epi8(3);
+    const __m128i c0 = _mm_and_si128(q, m3), c1 = _mm_and_si128(_mm_srli_epi16(q, 2), m3);
+    const __m128i c2 = _mm_and_si128(_mm_srli_epi16(q, 4), m3), c3 = _mm_and_si128(_mm_srli_epi16(q, 6), m3);
+    const __m128i a0 = _mm_unpacklo_epi8(c0, c1), b0 = _mm_unpacklo_epi8(c2, c3);
+    const __m128i a1 = _mm_unpackhi_epi8(c0, c1), b1 = _mm_unpackhi_epi8(c2, c3);
+    const __m256i lo = _mm256_set_m128i(_mm_unpackhi_epi16(a0, b0), _mm_unpacklo_epi16(a0, b0));
+    const __m256i hi = _mm256_set_m128i(_mm_unpackhi_epi16(a1, b1), _mm_unpacklo_epi16(a1, b1));
+    return _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+}
+
+template <int NT>
+inline void row20(const uint8_t* row, const ActH* const* y, float* res) {
+    __m512i V[NT][12];
+    for (int b = 0; b < 10; ++b) {
+        const __m512i c = q2_codes(row + (size_t) b * 18);
+        for (int t = 0; t < NT; ++t)
+            V[t][b] = _mm512_dpbusd_epi32(_mm512_setzero_si512(), c, _mm512_loadu_si512((const void*) (y[t]->q + 64 * b)));
+    }
+    for (int t = 0; t < NT; ++t) V[t][10] = V[t][11] = _mm512_setzero_si512();
+    // the 10 blocks' d (a gather at stride 18), each twice (two parts per block)
+    const __m512i gi = _mm512_mullo_epi32(_mm512_set_epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0), _mm512_set1_epi32(18));
+    const __m512i w16 = _mm512_mask_i32gather_epi32(_mm512_setzero_si512(), (__mmask16) 0x03FF, gi, (const void*) row, 1);
+    const __m512 dd = _mm512_cvtph_ps(_mm512_cvtepi32_epi16(w16));
+    const __m512 DW0 = _mm512_permutexvar_ps(_mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0), dd);
+    const __m512 DW1 = _mm512_maskz_permutexvar_ps((__mmask16) 0x000F, _mm512_set_epi32(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 9, 8, 8), dd);
+    // reduce4 of blocks 4g..: lane 4 L + j = block 4g+j's 16 values 16 L ..; + the neighbouring 128-bit lane gives part
+    // 2(4g+j) (lane j) and 2(4g+j)+1 (lane 8+j)
+    const __m512i pick = _mm512_set_epi32(0, 0, 0, 0, 0, 0, 0, 0, 11, 3, 10, 2, 9, 1, 8, 0);
+    for (int t = 0; t < NT; ++t) {
+        alignas(64) int si[32];
+        for (int g = 0; g < 3; ++g) {
+            __m512i r = reduce4(V[t][4 * g], V[t][4 * g + 1], V[t][4 * g + 2], V[t][4 * g + 3]);
+            r = _mm512_add_epi32(r, _mm512_shuffle_i32x4(r, r, 0xB1));
+            _mm256_store_si256((__m256i*) (si + 8 * g), _mm512_castsi512_si256(_mm512_permutexvar_epi32(pick, r)));
         }
-        {   // the part-ordered copy (down rows): values 0-7, 16-23, 8-15, 24-31
-            const __m128i l = _mm_loadu_si128((const __m128i*) (a.qs + 32 * b)), hh = _mm_loadu_si128((const __m128i*) (a.qs + 32 * b + 16));
-            _mm_storeu_si128((__m128i*) (a.qp + 32 * b), _mm_unpacklo_epi64(l, hh));
-            _mm_storeu_si128((__m128i*) (a.qp + 32 * b + 16), _mm_unpackhi_epi64(l, hh));
-        }
-        a.d8[b] = h2f(_cvtss_sh(d, _MM_FROUND_TO_NEAREST_INT));
-        a.d8x2[2 * b] = a.d8x2[2 * b + 1] = a.d8[b];
+        // the weight is code - 1: subtract each part's activation sum
+        const __m512i S0i = _mm512_sub_epi32(_mm512_load_si512(si), _mm512_loadu_si512((const void*) y[t]->ysum));
+        const __m512i S1i = _mm512_maskz_sub_epi32((__mmask16) 0x000F, _mm512_load_si512(si + 16), _mm512_maskz_loadu_epi32((__mmask16) 0x000F, y[t]->ysum + 16));
+        const __m512 D0 = _mm512_mul_ps(DW0, _mm512_loadu_ps(y[t]->d));
+        const __m512 D1 = _mm512_mul_ps(DW1, _mm512_maskz_loadu_ps((__mmask16) 0x000F, y[t]->d + 16));
+        const __m512 z = _mm512_setzero_ps();
+        // row_dot_20_sub16's lane l: part l, + part l + 16 (lanes < 4; +0 elsewhere), then the butterfly
+        const __m512 a = _mm512_fmadd_ps(D0, _mm512_cvtepi32_ps(S0i), z);
+        const __m512 b = _mm512_fmadd_ps(D1, _mm512_cvtepi32_ps(S1i), z);
+        res[t] = butterfly16(_mm512_add_ps(a, b));
+    }
+}
+template <int NT>
+void down20_t(const uint8_t* w, size_t row_bytes, const ActH* const* h, float* const* out, int r0, int r1) {
+    float res[NT];
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t) r * row_bytes;
+        _mm_prefetch((const char*) row + 2048, _MM_HINT_T0);
+        _mm_prefetch((const char*) row + 2048 + 64, _MM_HINT_T0);
+        row20<NT>(row, h, res);
+        for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
 
-bool gu_supported(int type) { return type == 18 || type == 21 || type == 22; }
+// the GPU's q8_1 block (quantize_q8_1_kernel / q8_1_store): the int8 values of 32 inputs and the fp16 scale as a
+// float.  amax is a max (any order); the block sum (ds.y) is not read by these formats' dots.
+inline float q8_1_block(const float* xb, int8_t* q) {
+    const __m512 absm = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
+    const __m512 v0 = _mm512_loadu_ps(xb), v1 = _mm512_loadu_ps(xb + 16);
+    const float am = _mm512_reduce_max_ps(_mm512_max_ps(_mm512_and_ps(v0, absm), _mm512_and_ps(v1, absm)));
+    float d = am / 127.0f;
+    if (std::fabs(d) > 65504.0f) d = std::copysign(65504.0f, d);   // q8_1_finite
+    if (am == 0.0f) {
+        std::memset(q, 0, 32);
+    } else {
+        const __m512 dv = _mm512_set1_ps(d);
+        for (int h = 0; h < 2; ++h) {
+            const __m512 t = _mm512_div_ps(h ? v1 : v0, dv);
+            // roundf: half away from zero.  t - trunc(t) is exact; |frac| >= 0.5 rounds away
+            const __m512 tr = _mm512_roundscale_ps(t, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+            const __m512 fr = _mm512_and_ps(_mm512_sub_ps(t, tr), absm);
+            const __mmask16 up = _mm512_cmp_ps_mask(fr, _mm512_set1_ps(0.5f), _CMP_GE_OQ);
+            const __m512 one = _mm512_or_ps(_mm512_set1_ps(1.0f), _mm512_andnot_ps(absm, t));   // copysign(1, t)
+            __m512 r = _mm512_mask_add_ps(tr, up, tr, one);
+            r = _mm512_min_ps(_mm512_max_ps(r, _mm512_set1_ps(-127.0f)), _mm512_set1_ps(127.0f));
+            _mm_storeu_si128((__m128i*) (q + 16 * h), _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(r)));
+        }
+    }
+    return h2f(_cvtss_sh(d, _MM_FROUND_TO_NEAREST_INT));
+}
 
-void gu_rows(int type, int nt, const uint8_t* blob, size_t gu_row, size_t up_off, const Act* const* act, float* const* h, int r0, int r1) {
+}  // namespace
+
+void quant_x(const float* x, int n, ActX& a) {
+    for (int b = 0; b < n / 32; ++b) a.d8[b] = q8_1_block(x + 32 * b, a.qs + 32 * b);
+}
+
+void quant_h(const float* h, int n, int d_type, ActH& a) {
+    alignas(16) int8_t q[32];
+    for (int b = 0; b < n / 32; ++b) {
+        const float d = q8_1_block(h + 32 * b, q);
+        if (d_type == 20) {   // IQ4_NL: part order (values 0-7, 16-23, 8-15, 24-31), each scale twice
+            const __m128i l = _mm_load_si128((const __m128i*) q), hh = _mm_load_si128((const __m128i*) (q + 16));
+            _mm_storeu_si128((__m128i*) (a.q + 32 * b), _mm_unpacklo_epi64(l, hh));
+            _mm_storeu_si128((__m128i*) (a.q + 32 * b + 16), _mm_unpackhi_epi64(l, hh));
+            a.d[2 * b] = a.d[2 * b + 1] = d;
+        } else {   // Q2_0: value order, the block's sum of the int8 values
+            std::memcpy(a.q + 32 * b, q, 32);
+            a.d[b] = d;
+            int sm = 0;
+            for (int i = 0; i < 32; ++i) sm += q[i];
+            a.ysum[b] = sm;
+        }
+    }
+}
+
+bool gu_supported(int type) { return type == 18 || type == 21 || type == 22 || type == 23; }
+bool down_supported(int type) { return type == 20 || type == 42; }
+
+void gu_rows(int type, int nt, const uint8_t* blob, size_t gu_row, size_t up_off, const ActX* const* act, float* const* h, int r0, int r1) {
     switch (type) {
         case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, act, h, r0, r1); break;
         case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, act, h, r0, r1); break;
         case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, act, h, r0, r1); break;
+        case 23: gu_rows_nt<23>(nt, blob, gu_row, up_off, act, h, r0, r1); break;
         default: break;
     }
 }
 
-void down_iq4nl(int nt, const uint8_t* w, size_t row_bytes, const Act* const* h, float* const* out, int r0, int r1) {
+void down_rows(int type, int nt, const uint8_t* w, size_t row_bytes, const ActH* const* h, float* const* out, int r0, int r1) {
     for (int t0 = 0; t0 < nt; t0 += 4) {
         const int k = nt - t0 < 4 ? nt - t0 : 4;
-        switch (k) {
-            case 1: down_t<1>(w, row_bytes, h + t0, out + t0, r0, r1); break;
-            case 2: down_t<2>(w, row_bytes, h + t0, out + t0, r0, r1); break;
-            case 3: down_t<3>(w, row_bytes, h + t0, out + t0, r0, r1); break;
-            default: down_t<4>(w, row_bytes, h + t0, out + t0, r0, r1); break;
+        if (type == 20) {
+            switch (k) {
+                case 1: down_t<1>(w, row_bytes, h + t0, out + t0, r0, r1); break;
+                case 2: down_t<2>(w, row_bytes, h + t0, out + t0, r0, r1); break;
+                case 3: down_t<3>(w, row_bytes, h + t0, out + t0, r0, r1); break;
+                default: down_t<4>(w, row_bytes, h + t0, out + t0, r0, r1); break;
+            }
+        } else {
+            switch (k) {
+                case 1: down20_t<1>(w, row_bytes, h + t0, out + t0, r0, r1); break;
+                case 2: down20_t<2>(w, row_bytes, h + t0, out + t0, r0, r1); break;
+                case 3: down20_t<3>(w, row_bytes, h + t0, out + t0, r0, r1); break;
+                default: down20_t<4>(w, row_bytes, h + t0, out + t0, r0, r1); break;
+            }
         }
     }
 }

@@ -14,7 +14,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/sexp.hpp"
-#include "cpu/replica_avx512.hpp"
+#include "strata/kernels/cpu/replica_avx512.hpp"
 
 #include "ggml.h"
 
@@ -371,9 +371,10 @@ int check(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int layer, 
     }
     // the AVX-512 replica: bit for bit against the GPU, every width
     namespace rp = cpu::replica;
-    if (cpu::cpu_avx512_ok() && rp::gu_supported(f.gu_type) && f.d_type == 20) {
-        std::vector<rp::Act> xa(NTMAX), ha(NTMAX);
-        for (int k = 0; k < NTMAX; ++k) rp::quant(x.data() + k * H, (int) H, xa[k]);
+    if (cpu::cpu_avx512_ok() && rp::gu_supported(f.gu_type) && rp::down_supported(f.d_type)) {
+        std::vector<rp::ActX> xa(NTMAX);
+        std::vector<rp::ActH> ha(NTMAX);
+        for (int k = 0; k < NTMAX; ++k) rp::quant_x(x.data() + k * H, (int) H, xa[k]);
         size_t xq_diff = 0;
         for (int k = 0; k < NTMAX; ++k)
             for (int64_t b = 0; b < H / 32; ++b) {
@@ -387,14 +388,14 @@ int check(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int layer, 
             cudaStreamSynchronize(s);
             std::vector<float> gout((size_t) nt * H), hh((size_t) nt * FF), out((size_t) nt * H);
             cudaMemcpy(gout.data(), dout, gout.size() * 4, cudaMemcpyDeviceToHost);
-            const rp::Act* ap[NTMAX];
-            const rp::Act* hp[NTMAX];
+            const rp::ActX* ap[NTMAX];
+            const rp::ActH* hp[NTMAX];
             float* hpp[NTMAX];
             float* op[NTMAX];
             for (int k = 0; k < nt; ++k) { ap[k] = &xa[k]; hp[k] = &ha[k]; hpp[k] = hh.data() + k * FF; op[k] = out.data() + k * H; }
             rp::gu_rows(f.gu_type, nt, blob.data(), f.gu_row, f.up_off, ap, hpp, 0, (int) FF);
-            for (int k = 0; k < nt; ++k) rp::quant(hh.data() + k * FF, (int) FF, ha[k]);
-            rp::down_iq4nl(nt, blob.data() + f.down_off, f.d_row, hp, op, 0, (int) H);
+            for (int k = 0; k < nt; ++k) rp::quant_h(hh.data() + k * FF, (int) FF, f.d_type, ha[k]);
+            rp::down_rows(f.d_type, nt, blob.data() + f.down_off, f.d_row, hp, op, 0, (int) H);
             const size_t d = ndiff(out.data(), gout.data(), out.size());
             std::printf("  avx512 replica, %d entr%s: x q8_1 %s, out %zu/%zu differ\n", nt, nt == 1 ? "y" : "ies",
                         xq_diff ? "DIFFERS" : "equal", d, out.size());
@@ -423,7 +424,7 @@ int bench(const strata::GgufModel& model, int layer, int nth) {
     cpu::NativeFmt f;
     std::string err;
     if (!t[0] || !cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) return 1;
-    if (!rp::gu_supported(f.gu_type) || f.d_type != 20) { std::printf("layer %d: not in the prototype\n", layer); return 0; }
+    if (!rp::gu_supported(f.gu_type) || !rp::down_supported(f.d_type)) { std::printf("layer %d: not in the prototype\n", layer); return 0; }
     constexpr int NE = 64;
     std::vector<std::vector<uint8_t>> blobs(NE, std::vector<uint8_t>(f.bytes));
     for (int e = 0; e < NE; ++e) {
@@ -442,10 +443,11 @@ int bench(const strata::GgufModel& model, int layer, int nth) {
         for (int way = 0; way < 2; ++way) {
             auto work = [&](int tid, int reps) {
                 std::vector<std::vector<uint8_t>> act(NTMAX, std::vector<uint8_t>(cpu::kNativeActBytes)), hq(NTMAX, std::vector<uint8_t>(cpu::kNativeHBytes));
-                std::vector<rp::Act> xa(NTMAX), ha(NTMAX);
+                std::vector<rp::ActX> xa(NTMAX);
+                std::vector<rp::ActH> ha(NTMAX);
                 std::vector<float> ff((size_t) NTMAX * FF), out((size_t) NTMAX * H);
                 const void* ap[NTMAX]; const void* hp[NTMAX]; float* fp[NTMAX]; float* op[NTMAX];
-                const rp::Act* xap[NTMAX]; const rp::Act* hap[NTMAX];
+                const rp::ActX* xap[NTMAX]; const rp::ActH* hap[NTMAX];
                 for (int k = 0; k < NTMAX; ++k) {
                     ap[k] = act[k].data(); hp[k] = hq[k].data(); fp[k] = ff.data() + k * FF; op[k] = out.data() + k * H;
                     xap[k] = &xa[k]; hap[k] = &ha[k];
@@ -459,10 +461,10 @@ int bench(const strata::GgufModel& model, int layer, int nth) {
                             if (stage & 4) for (int k = 0; k < nt; ++k) cpu::native_quant_h(f, fp[k], hq[k].data());
                             if (stage & 8) cpu::native_down_rows(f, b, hp, nt, op, 0, (int) H);
                         } else {
-                            if (stage & 1) for (int k = 0; k < nt; ++k) rp::quant(x.data() + k * H, (int) H, xa[k]);
+                            if (stage & 1) for (int k = 0; k < nt; ++k) rp::quant_x(x.data() + k * H, (int) H, xa[k]);
                             if (stage & 2) rp::gu_rows(f.gu_type, nt, b, f.gu_row, f.up_off, xap, fp, 0, (int) FF);
-                            if (stage & 4) for (int k = 0; k < nt; ++k) rp::quant(fp[k], (int) FF, ha[k]);
-                            if (stage & 8) rp::down_iq4nl(nt, b + f.down_off, f.d_row, hap, op, 0, (int) H);
+                            if (stage & 4) for (int k = 0; k < nt; ++k) rp::quant_h(fp[k], (int) FF, f.d_type, ha[k]);
+                            if (stage & 8) rp::down_rows(f.d_type, nt, b + f.down_off, f.d_row, hap, op, 0, (int) H);
                         }
                     }
             };

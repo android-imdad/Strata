@@ -1270,10 +1270,12 @@ if(STRATA_NATIVE_EXPERTS)
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
-                                           src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp)
+                                           src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
+                                           src/kernels/cpu/replica_avx512.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    set_source_files_properties(src/kernels/cpu/replica_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/fp:precise")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     # the router lookahead's AVX1 dot (older CPUs; called behind cpu_avx1_ok): no FMA, no 256-bit integer ops
@@ -1286,6 +1288,9 @@ if(STRATA_NATIVE_EXPERTS)
   else()
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+    # STRATA_CPU_PARITY's replica of the GPU expert arithmetic: no contraction (its fmas are explicit)
+    set_source_files_properties(src/kernels/cpu/replica_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma;-ffp-contract=off")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
@@ -1496,11 +1501,10 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_expert_bench src/kernels/native_expert_bench.cpp)
     target_include_directories(native_expert_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(native_expert_bench PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
-    # prototype: CPU replica of the GPU expert arithmetic (CPU/GPU parity), bit for bit against native_expert_grouped
-    add_executable(expert_replica src/kernels/expert_replica.cpp src/kernels/cpu/replica_avx512.cpp)
+    # STRATA_CPU_PARITY: the CPU replica of the GPU expert arithmetic, bit for bit against native_expert_grouped on
+    # a model's real experts (expert_replica <shard.gguf> [layer ...]; --bench times it against today's CPU path)
+    add_executable(expert_replica src/kernels/expert_replica.cpp)
     set_source_files_properties(src/kernels/expert_replica.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
-    set_source_files_properties(src/kernels/cpu/replica_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma;-ffp-contract=off")
     target_include_directories(expert_replica PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(expert_replica PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
     if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)

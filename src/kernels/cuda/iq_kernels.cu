@@ -2796,6 +2796,14 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
     }
 }
 
+bool swiglu_sexp() noexcept {
+#ifdef STRATA_SWIGLU_SEXP
+    return true;
+#else
+    return false;
+#endif
+}
+
 void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream) {
     const long long n = (long long) n_rows * n_cols;
     if (n <= 0) return;

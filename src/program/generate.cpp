@@ -44,6 +44,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -2758,6 +2759,12 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+    }
+    if (std::getenv("STRATA_CPU_PARITY") != nullptr) {
+        std::string why;
+        strata::kernels::cpu::cpu_parity_init(strata::kernels::swiglu_sexp(), why);
+        std::fprintf(stderr, "strata generate: STRATA_CPU_PARITY: %s%s\n", why.c_str(),
+                     strata::kernels::cpu::cpu_parity() ? " (the CPU expert rows in the GPU's arithmetic, bit for bit)" : "");
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
     // STRATA_EARLY_REMOTE_CONTEXTS=1: create EVERY secondary context here, like CUDA1's.  Under WSL2 the driver's
