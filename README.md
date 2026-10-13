@@ -13,6 +13,28 @@ Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Nex
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
 and coding agents. Nothing leaves your PC.
 
+## This fork: the RX 7900 XTX edition
+
+> This branch is [upstream Strata](https://github.com/Niko1221/Strata) with speedups for the **AMD Radeon RX 7900 XTX**
+> (gfx1100). **The output is bit-identical to upstream:** teacher-forced KL 0.0000, the same token at every position.
+> Nothing trades quality for speed.
+
+Same PC, same day, same settings, upstream main against this branch (RX 7900 XTX 24 GB, Ryzen 7 9800X3D, 62 GiB RAM,
+Linux, ROCm 10.2, IQ3_S, every output-changing switch off):
+
+| | Upstream | RX 7900 XTX edition | |
+| --- | ---: | ---: | ---: |
+| Writes answers | 86.8 tokens/s | 95.8 tokens/s | **+10%** |
+| Reads a 4K prompt | 1,069 tokens/s | 1,427 tokens/s | **+34%** |
+| Reads a 16K prompt | 1,381 tokens/s | 1,827 tokens/s | **+32%** |
+| Reads a 32K prompt | 1,421 tokens/s | 1,844 tokens/s | **+30%** |
+| Agent turn, first token | 3.90 s | 2.92 s | **-25%** |
+
+How: faster decode kernels ([PR #2231](https://github.com/Niko1221/Strata/pull/2231)), and the prompt's expert
+products computed in exactly rocBLAS's summation order, but grouped and on a Tensile-generated kernel for this card
+(`STRATA_PF_GU_EXACT=1`), about 2x faster for that step. Details, flags and how it was checked:
+**[docs/RX7900XTX.md](docs/RX7900XTX.md)**.
+
 ## How fast is it?
 
 We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
