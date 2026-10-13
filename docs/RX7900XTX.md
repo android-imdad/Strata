@@ -96,7 +96,11 @@ That makes the draft policy a pure speed setting. On rewrite turns (the model re
 | `--spec-min-p 0.70`, no lookup | 134 tokens/s (median of 3) |
 | `--spec-min-p 0.5 --lookup-chain 3` | 145 tokens/s (median of 3), same bytes |
 
-Ordinary chat and agent turns are unchanged by the policy (within noise); `STRATA_IQ_MT_MIN` itself costs 0-5% there.
+The MTP drafter's own depth is a speed setting too now. With `--spec 4` it stops at 3 guesses although its acceptance is
+still ~85-90% there; with `--spec 6` acceptance stays ~80% down to the fifth guess. Two alternating rounds of thinking-on
+questions, a coding task and a rewrite (slots pinned): `--spec 6` was fastest in every request, about +5-20% over
+`--spec 4` (thinking turns most), for ~6 MiB of VRAM; `--spec 8` drafts too deep, and `--spec-min-p` 0.4 / 0.3 did not
+beat 0.5. Ordinary chat and agent turns gain nothing from the lookup chain; `STRATA_IQ_MT_MIN` itself costs 0-5% there.
 The reference this matches is one-token decoding, not the engine without the switch (whose replies follow the drafts).
 
 ## Use it
@@ -118,7 +122,7 @@ Then add to the `env` of your `strata-*.json` (all bit-exact):
 "STRATA_IQ_MT_MIN": "1"
 ```
 
-and, for deterministic decode with faster rewrite turns, to its `args`: `--spec-min-p 0.5 --lookup-chain 3`.
+and, for deterministic decode with faster drafting, set its `args` to `--spec 6 --spec-min-p 0.5 --lookup-chain 3`.
 
 The log says whether it is on:
 
