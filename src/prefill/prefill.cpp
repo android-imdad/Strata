@@ -6,6 +6,7 @@
 #endif
 #include "mmq_resident_sort.hpp"
 #include "wmma_gemm.h"
+#include "strata/prefill/gu_exact.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
@@ -308,6 +309,22 @@ inline int ring_slots(size_t T) {
     return (int64_t) T >= stream_all_min() ? big : STAGE;
 }
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
+// STRATA_PF_GU_EXACT=G (HIP, opt-in; 1 = 16): the gate/up products of up to G experts with >= 65 tokens wait for one
+// launch (gu_exact.hpp: rocBLAS's own summation order, the same bits); each keeps its own dequantized buffers until
+// then, so the ring gains G entries.  0 = off: every call as before.
+inline int gu_exact_group() {
+#if defined(__HIPCC__)
+    static const int g = [] {
+        const char* v = std::getenv("STRATA_PF_GU_EXACT");
+        const int n = v ? std::atoi(v) : 0;
+        return n <= 0 ? 0 : n == 1 ? 16 : std::min(n, strata::prefill::kGuExactMax);
+    }();
+    return g;
+#else
+    return 0;
+#endif
+}
+constexpr int DQ_MAX = DQ + strata::prefill::kGuExactMax;
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
 // second GEMM (Y = W.hi + W.lo, ~16 mantissa bits): a router that picks its top 10 from the same x decode would.
@@ -836,8 +853,9 @@ struct Prefill::Impl {
     int32_t* grp_host = nullptr;
     int32_t* grp_dev = nullptr;          // its device alias
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
-    uint16_t* dq_gu[DQ] = {};
-    uint16_t* dq_d[DQ] = {};
+    uint16_t* dq_gu[DQ_MAX] = {};
+    uint16_t* dq_d[DQ_MAX] = {};
+    bool gu_exact_ok = false;   // STRATA_PF_GU_EXACT passed its start-up check against Gemm::f16
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
@@ -1075,6 +1093,72 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
 }
 }
 
+namespace {
+// STRATA_PF_GU_EXACT's start-up check: random experts at token counts across its range, one grouped launch against
+// Gemm::f16 (the call it stands in for, on this engine's handle and settings) bit for bit.  A difference, a count that
+// would not reach rocBLAS, or no room for the test buffers keeps it off.
+bool gu_exact_check(Gemm& gemm, int device, cudaStream_t stream) {
+    const core::OnDevice on(device);
+    static const int Ts[] = {65, 66, 96, 127, 128, 129, 200, 255, 333, 512, 777, 1024, 2047, 4100};
+    constexpr int NE = (int) (sizeof Ts / sizeof Ts[0]);
+    const char* why = nullptr;
+    for (int T : Ts)
+        if (!gemm.f16_on_rocblas(T, 1280, 2560)) why = "the product does not run on rocBLAS here (another GEMM path is chosen)";
+    int64_t rows = 0;
+    for (int T : Ts) rows += T;
+    uint16_t *x = nullptr, *w = nullptr;
+    float *y = nullptr, *r = nullptr;
+    const size_t xb = (size_t) rows * 2560 * 2, wb = (size_t) 2 * 1280 * 2560 * 2, yb = (size_t) rows * 1280 * 4;
+    if (!why && (cudaMalloc(&x, xb) != cudaSuccess || cudaMalloc(&w, wb) != cudaSuccess || cudaMalloc(&y, yb) != cudaSuccess ||
+                 cudaMalloc(&r, yb) != cudaSuccess))
+        why = "no room for the check's buffers";
+    bool same = false;
+    if (!why) {
+        // random FP16 bits: activations around 2^-6..2^0, weights around 2^-10..2^-3, both signs (no inf / NaN)
+        uint64_t st = 0x9e3779b97f4a7c15ull;
+        auto rnd = [&]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+        auto fill = [&](std::vector<uint16_t>& v, int e_lo, int e_n) {
+            for (auto& h : v) {
+                const uint64_t b = rnd();
+                h = (uint16_t) (((b & 1) << 15) | ((uint64_t) (e_lo + (int) ((b >> 1) % (uint64_t) e_n)) << 10) | ((b >> 8) & 0x3ff));
+            }
+        };
+        std::vector<uint16_t> hx((size_t) rows * 2560), hw((size_t) 2 * 1280 * 2560);
+        fill(hx, 9, 7);
+        fill(hw, 5, 8);
+        cudaMemcpy(x, hx.data(), xb, cudaMemcpyHostToDevice);
+        cudaMemcpy(w, hw.data(), wb, cudaMemcpyHostToDevice);
+        GuExactGroup g;
+        int64_t o = 0;
+        for (int e = 0; e < NE; ++e) {
+            g.x[e] = x + (size_t) o * 2560;
+            g.w[e] = w + (size_t) (e % 2) * 1280 * 2560;
+            g.y[e] = y + (size_t) o * 1280;
+            g.t[e] = Ts[e];
+            gemm.f16(g.x[e], g.w[e], r + (size_t) o * 1280, Ts[e], 1280, 2560);
+            o += Ts[e];
+        }
+        g.n = NE;
+        if (!gu_exact_run(g, stream)) why = "the launch failed";
+        cudaStreamSynchronize(stream);
+        if (!why) {
+            std::vector<float> a((size_t) rows * 1280), b(a.size());
+            cudaMemcpy(a.data(), y, yb, cudaMemcpyDeviceToHost);
+            cudaMemcpy(b.data(), r, yb, cudaMemcpyDeviceToHost);
+            same = std::memcmp(a.data(), b.data(), yb) == 0;
+            if (!same) why = "its products differ from rocBLAS's here (another library build?)";
+        }
+    }
+    for (void* p : {(void*) x, (void*) w, (void*) y, (void*) r})
+        if (p) cudaFree(p);
+    (void) cudaGetLastError();
+    if (why) std::fprintf(stderr, "strata prefill: STRATA_PF_GU_EXACT off: %s\n", why);
+    else std::fprintf(stderr, "strata prefill: STRATA_PF_GU_EXACT: the experts' gate/up products from 65 tokens, %d experts a launch "
+                              "(checked bit for bit against rocBLAS at %d token counts)\n", gu_exact_group(), NE);
+    return same && !why;
+}
+}  // namespace
+
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes) {
@@ -1222,6 +1306,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.gemm.set_f16_io(m.f16_io);
         set_act_f16(m.f16_io);
     }
+    if (gu_exact_group() > 0 && !m.gu_exact_ok) m.gu_exact_ok = gu_exact_check(m.gemm, m.device, (cudaStream_t) stream);
     if (!carve(T, &o)) {
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
@@ -1301,7 +1386,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         }
         if (base == nullptr) ok = false;
     }
-    for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+    for (int i = 0; i < DQ + gu_exact_group(); ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
@@ -1899,7 +1984,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
-    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+    for (int i = 0; i < DQ + gu_exact_group(); ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
@@ -3878,6 +3963,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         };
                         // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                         // expert) is released once the blob is read
+                        // STRATA_PF_GU_EXACT: the deferred experts (their dequantized buffers DQ.. stay theirs until the flush)
+                        GuExactGroup gx;
+                        int64_t gx_o0[kGuExactMax] = {};
+                        int gx_q[kGuExactMax] = {};
+                        auto gx_flush = [&]() {
+                            if (gx.n == 0) return;
+                            pt.mark(kPfGemmGU, cs);
+                            if (!gu_exact_run(gx, m.cs))   // (a failed launch: the same products, one call each)
+                                for (int i = 0; i < gx.n; ++i) m.gemm.f16(gx.x[i], gx.w[i], gx.y[i], gx.t[i], 1280, N);
+                            for (int i = 0; i < gx.n; ++i) {
+                                const int64_t o0 = gx_o0[i], ne = gx.t[i];
+                                swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                m.gemm.f16(m.Hh + o0 * 640, m.dq_d[gx_q[i]], m.Dm + o0 * N, ne, N, 640);
+                            }
+                            gx.n = 0;
+                        };
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                             const int32_t e = order[j];
                             pt.mark(kPfDequant, cs);
@@ -3926,7 +4028,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.mmq_ctx->run(dn, m.cs);
                                 return true;
                             }
-                            const int q = (int) (j % DQ);
+                            const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
+                            const bool defer = m.gu_exact_ok && N == 2560 && ne >= kGuExactMinT && ne <= kGuExactMaxT &&
+                                               m.gemm.f16_on_rocblas(ne, 1280, N);
+                            const int q = defer ? DQ + gx.n : (int) (j % DQ);
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
@@ -3937,7 +4042,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }
                             if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; m.used_bid[slot] = 0; }
-                            const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
+                            if (defer) {
+                                gx.x[gx.n] = m.Xs + o0 * N;
+                                gx.w[gx.n] = m.dq_gu[q];
+                                gx.y[gx.n] = m.GU + o0 * 1280;
+                                gx.t[gx.n] = (int) ne;
+                                gx_o0[gx.n] = o0;
+                                gx_q[gx.n] = q;
+                                if (++gx.n == gu_exact_group()) gx_flush();
+                                return true;
+                            }
                             pt.mark(kPfGemmGU, cs);
                             m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
                             swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
@@ -4010,6 +4124,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             release_to(m.g->n_expert);
                         }
+                        gx_flush();   // STRATA_PF_GU_EXACT: the layer's last group
                     }
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail

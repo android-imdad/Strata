@@ -590,6 +590,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_HIP)
     # #313: the RDNA3 WMMA GEMMs include hip_runtime.h: AMD builds only (a CUDA build never sees this file)
     target_sources(strata_prefill PRIVATE src/prefill/wmma_gemm.cu)
+    # STRATA_PF_GU_EXACT: the experts' gate/up product for a group of experts, bit for bit rocBLAS's fallback
+    target_sources(strata_prefill PRIVATE src/prefill/gu_exact.cu)
   endif()
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
