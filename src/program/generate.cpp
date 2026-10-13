@@ -10883,10 +10883,14 @@ int main(int argc, char** argv) {
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 pp_exact = true;   // between windows the session is exactly at `a`
+                // STRATA_READ_WINDOW=N (debug): read through windows of at most N tokens (1 = one token a window, the
+                // reference for checks that a window's tokens come out as they would alone)
+                static const int read_window = [] { const char* v = std::getenv("STRATA_READ_WINDOW"); return v ? std::atoi(v) : 0; }();
+                const int S_read = read_window > 0 ? std::min(read_window, S) : S;
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     pp_exact = false;   // until this window and the drafter's rows are in
-                    const int T = (int) std::min<int64_t>(S, b - q);
+                    const int T = (int) std::min<int64_t>(S_read, b - q);
                     for (int t = 0; t < T; ++t) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
                         nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
