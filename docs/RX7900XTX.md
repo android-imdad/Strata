@@ -83,8 +83,10 @@ different reply from run to run. The cause on this card is the CPU expert rows, 
 
 Upstream's `STRATA_IQ_MT_MIN=1` computes every CPU row independently of the window. With it, teacher-forced reading
 through windows of **1, 2, 3, 4, 5, 6 and 8 tokens gives byte-identical log-probabilities** (2,557 positions, KL 0.0000,
-the same 36 GDN layer states), so every token is exactly what one-token-at-a-time decoding would give, and the reply is
-the same every run. Checked with the debug knob `STRATA_READ_WINDOW=N` (read through windows of at most N tokens) and
+the same 36 GDN layer states), so every token is exactly what one-token-at-a-time decoding would give: the reply no
+longer depends on the drafts or on timing. It can still change when the expert placement changes (how many experts fit
+in VRAM, which other programs' VRAM use can shift by a few slots), because an expert computed on the CPU differs from the
+GPU's result in the last bits; for the same placement it is the same. Checked with the debug knob `STRATA_READ_WINDOW=N` (read through windows of at most N tokens) and
 `kl.py`; end to end, a 2,425-token file rewrite returned byte-identical replies under four draft policies.
 
 That makes the draft policy a pure speed setting. On rewrite turns (the model returns a file with small edits):
