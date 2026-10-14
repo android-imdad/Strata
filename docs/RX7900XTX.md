@@ -27,7 +27,9 @@ defaults, every output-changing switch off) against this fork merged with 0.1.44
 
 Reports: [bench/results/2026-10-14-...-0.1.44](../bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44/).
 Merging 0.1.44.1 changed none of this fork's output (kl.py: 2,557 positions identical, perplexity 4.447 = 4.447, with
-8K and with exact 32K chunks). Upstream's agent decode improved in 0.1.44 and is now close to this fork's; its new
+8K and with exact 32K chunks), and decode did not get slower: with the same drafts on both engines (5 paired rounds,
+3,580 windows, every reply identical) the merged engine takes 30.49 ms a window against 30.75 before it. Regular
+benchmark runs differ by a few percent in decode because the drafts follow measured timings. Upstream's agent decode improved in 0.1.44 and is now close to this fork's; its new
 default STRATA_COMMIT_BATCH measured neutral here (=0: the same within noise).
 
 The earlier comparison, against upstream main `a0116b27` (13 October, strict config, before parts 4 and 5):

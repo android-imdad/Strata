@@ -107,8 +107,8 @@ and to `args`, for deterministic decode with faster drafting:
 With the parity build, also add `"STRATA_CPU_PARITY": "1"` to `env` and `"--kv-resident", "32768"` to `args`
 (+8% decode in agent sessions).
 
-Optional, from upstream 0.1.44: `"STRATA_MTP_HIP_PRIO": "1"` gives the drafter its own GPU queue (agent decode about
-+3% here, short chat within noise; the output does not change). Do not set `STRATA_COPY_HIP_PRIO=1` on this card: it
+Optional, from upstream 0.1.44: `"STRATA_MTP_HIP_PRIO": "1"` gives the drafter its own GPU queue (agent decode +3% in one
+benchmark, short chat within noise - inside the run-to-run spread, so not a proven gain; the output does not change). Do not set `STRATA_COPY_HIP_PRIO=1` on this card: it
 hangs the engine.
 
 Faster long prompts with the same output: add `"STRATA_PF_PIECE": "8192"` to `env` and change `"--prefill", "auto"` to
