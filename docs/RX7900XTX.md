@@ -46,7 +46,7 @@ dequant of Q6_K / IQ4_XS. On by default, each with an `=0` switch; plus opt-ins 
 In a prompt about half the GPU time is the routed experts' gate/up product (FP16 x FP16 -> FP32, 1280 x 2560 per
 expert). It has no hipBLASLt tuning, so it falls back to rocBLAS's generic Tensile kernels, which do not use the matrix
 cores and reach 6-13 TFLOPS on this card. Any faster kernel adds the products in another order, which changes the
-output a little (that is why `STRATA_PF_GEMM` moves perplexity from 4.486 to 4.506).
+output a little (that is why `STRATA_PF_GEMM` moves perplexity from 4.447 to 4.508).
 
 This branch reproduces rocBLAS's order instead. Read from its kernels and checked bit for bit:
 
