@@ -11,7 +11,26 @@ Measured on: RX 7900 XTX 24 GB (gfx1100), Ryzen 7 9800X3D, 62 GiB RAM, Linux 7.2
 
 ## Results
 
-`tools/strata_bench.py --long`, same day, same config, alternating rounds, medians of 3 runs per test.
+`tools/strata_bench.py --long`, same day, alternating rounds, medians of 3 runs per test. Upstream 0.1.44.1 (its
+defaults, every output-changing switch off) against this fork merged with 0.1.44.1 (parts 1-5 with the parity build,
+`STRATA_MTP_HIP_PRIO=1`):
+
+| Test | Upstream 0.1.44.1 `296b59d2` | This fork | Change |
+| --- | ---: | ---: | ---: |
+| Short chat, writes answers | 86.9 tokens/s | 95.7 tokens/s | **+10%** |
+| Short chat, first token | 1.14 s | 0.84 s | **-26%** |
+| 4K prompt, reads | 1,045 tokens/s | 1,390 tokens/s | **+33%** |
+| 16K prompt, reads | 1,356 tokens/s | 1,867 tokens/s | **+38%** |
+| 32K prompt, reads | 1,371 tokens/s | 1,938 tokens/s | **+41%** |
+| Agent session, first token per turn | 4.03 s | 3.01 s | **-25%** |
+| Agent session, writes answers | 95.4 tokens/s | 97.7 tokens/s | +2% |
+
+Reports: [bench/results/2026-10-14-...-0.1.44](../bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44/).
+Merging 0.1.44.1 changed none of this fork's output (kl.py: 2,557 positions identical, perplexity 4.447 = 4.447, with
+8K and with exact 32K chunks). Upstream's agent decode improved in 0.1.44 and is now close to this fork's; its new
+default STRATA_COMMIT_BATCH measured neutral here (=0: the same within noise).
+
+The earlier comparison, against upstream main `a0116b27` (13 October, strict config, before parts 4 and 5):
 
 | Test | Upstream main `a0116b27` | This branch | Change |
 | --- | ---: | ---: | ---: |

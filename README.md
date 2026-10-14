@@ -9,15 +9,23 @@ a 125-billion-parameter model, on one gaming PC. This fork tunes it for the RX 7
 **bit-identical** to upstream (the same log-probabilities and the same token at every position, so the same perplexity): faster, with nothing traded
 for quality. The one exception is an opt-in build, described under [Install](#install).
 
-Same PC, same day, same settings (RX 7900 XTX 24 GB, Ryzen 7 9800X3D, 62 GiB RAM, Linux, ROCm 10.2, IQ3_S):
+Upstream Strata 0.1.44.1 against this fork (merged with 0.1.44.1), same PC, same day, alternating rounds, medians of 3
+(RX 7900 XTX 24 GB, Ryzen 7 9800X3D, 62 GiB RAM, Linux, ROCm 10.2, IQ3_S):
 
-| | Upstream | RX 7900 XTX edition | |
+| | Upstream 0.1.44.1 | RX 7900 XTX edition | |
 | --- | ---: | ---: | ---: |
-| Writes answers | 86.8 tokens/s | 95.8 tokens/s | **+10%** |
-| Reads a 4K prompt | 1,069 tokens/s | 1,427 tokens/s | **+34%** |
-| Reads a 16K prompt | 1,381 tokens/s | 1,827 tokens/s | **+32%** |
-| Reads a 32K prompt | 1,421 tokens/s | 1,844 tokens/s | **+30%** |
-| Agent turn, first token | 3.90 s | 2.92 s | **-25%** |
+| Writes answers (short chat) | 86.9 tokens/s | 95.7 tokens/s | **+10%** |
+| First token (short chat) | 1.14 s | 0.84 s | **-26%** |
+| Reads a 4K prompt | 1,045 tokens/s | 1,390 tokens/s | **+33%** |
+| Reads a 16K prompt | 1,356 tokens/s | 1,867 tokens/s | **+38%** |
+| Reads a 32K prompt | 1,371 tokens/s | 1,938 tokens/s | **+41%** |
+| Agent turn, first token | 4.03 s | 3.01 s | **-25%** |
+| Agent session, writes answers | 95.4 tokens/s | 97.7 tokens/s | +2% |
+
+The fork runs the settings below, including the opt-in parity build and exact 32K prompt chunks. Upstream runs its
+defaults with every output-changing switch off. Writing speed moves about 5% between runs, so read the decode rows as
+approximate; every prompt and first-token round of the fork beat every round of upstream. Reports:
+[bench/results/2026-10-14-...-0.1.44](bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44/).
 
 Decode is also deterministic: the same question gives the same answer whatever the drafter does (and, with an opt-in
 build, whatever the expert placement).
@@ -98,6 +106,10 @@ and to `args`, for deterministic decode with faster drafting:
 
 With the parity build, also add `"STRATA_CPU_PARITY": "1"` to `env` and `"--kv-resident", "32768"` to `args`
 (+8% decode in agent sessions).
+
+Optional, from upstream 0.1.44: `"STRATA_MTP_HIP_PRIO": "1"` gives the drafter its own GPU queue (agent decode about
++3% here, short chat within noise; the output does not change). Do not set `STRATA_COPY_HIP_PRIO=1` on this card: it
+hangs the engine.
 
 Faster long prompts with the same output: add `"STRATA_PF_PIECE": "8192"` to `env` and change `"--prefill", "auto"` to
 `"--prefill", "auto:32768"` in `args`. Prompts are read in 32K chunks but computed exactly as 8K chunks, so the output
