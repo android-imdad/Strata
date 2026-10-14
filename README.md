@@ -33,7 +33,7 @@ build, whatever the expert placement). Flags and how it was checked: **[docs/RX7
 **[Niko](https://github.com/Niko1221)** and **[Strata](https://github.com/Niko1221/Strata)**, on which all of this is
 built.
 
-<p align="center"><a href="https://ko-fi.com/imdadismail"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support this fork on Ko-fi" height="48"></a><br>
+<p align="center"><a href="https://ko-fi.com/imdadismail"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support this fork on Ko-fi" height="96"></a><br>
 <sub>This fork is free. If it runs well on your RX 7900 XTX, a coffee keeps the benchmarking going.</sub></p>
 
 <details>
