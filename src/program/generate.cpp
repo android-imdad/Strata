@@ -11990,7 +11990,8 @@ int main(int argc, char** argv) {
             std::vector<int32_t> drafts(DS, 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob(DS, 0.0f);
             std::vector<int32_t> sbuf((size_t) S, 0);
-            const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
+            // STRATA_SPEC_LOOKUP_Q (the lookup-boosted draft rule) needs the suffix index too
+            const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0 || [] { const char* e = std::getenv("STRATA_SPEC_LOOKUP_Q"); return e && std::atof(e) > 0; }();
             if (sfx_on) {
                 sfx.reset();
                 for (int64_t t : ids) sfx.append((int32_t) t);
@@ -12732,21 +12733,41 @@ int main(int argc, char** argv) {
                 }
             };
             static SpecCal spec_cal;   // kept across requests
+            // STRATA_SPEC_LOOKUP_Q=q (with STRATA_SPEC_CUM): a draft that the suffix lookup (prompt + output so far) also
+            // proposes at its place counts q in the product - the lookup's agreement was the strongest sign that a
+            // draft holds (logistic fit over logged windows: weight +1.5, the draft layer's own log-probability +0.8).
+            // STRATA_SPEC_DEPTH_DECAY=d: every other draft counts p * d^j (the draft layer is overconfident past its
+            // first draft).  Replayed on logged windows: STRATA_SPEC_CUM=0.3 + q 0.95 + d 0.9 +3.9% over CUM 0.5.
+            static const double spec_lookup_q = [] { const char* e = std::getenv("STRATA_SPEC_LOOKUP_Q"); return e ? std::atof(e) : 0.0; }();
+            static const double spec_depth_decay = [] { const char* e = std::getenv("STRATA_SPEC_DEPTH_DECAY"); return e ? std::atof(e) : 1.0; }();
+            int32_t spec_lk[8];
+            int spec_lk_n = 0;   // the suffix lookup's proposal for the next window's drafts (made with them)
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
                     double cum = 1.0;
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) {
-                        cum *= spec_cal_on ? spec_cal.q(T - 1, dprob[(size_t) T - 1]) : (double) dprob[(size_t) T - 1];
+                        const int j = T - 1;
+                        if (spec_lookup_q > 0.0 && !first_window)
+                            cum *= mtp.stop_q(j, drafts[(size_t) j], dprob[(size_t) j]);   // the same hint the drafter had
+                        else
+                            cum *= spec_cal_on ? spec_cal.q(j, dprob[(size_t) j]) : (double) dprob[(size_t) j];
                         if (spec_cum > 0.0 && cum < spec_cum) break;
                         ++T;
                     }
                 }
                 float wprob[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // this window's draft probabilities (log, calibration)
+                float wp2[8] = {0, 0, 0, 0, 0, 0, 0, 0}, wh[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // STRATA_SPEC_FEAT
+                int32_t wtok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                 int wn = 0;
                 if ((spec_log != nullptr || spec_cal_on) && use_mtp)
-                    for (; wn < 8 && wn < (int) dprob.size() && dprob[(size_t) wn] > 0.0f; ++wn) wprob[wn] = dprob[(size_t) wn];
+                    for (; wn < 8 && wn < (int) dprob.size() && dprob[(size_t) wn] > 0.0f; ++wn) {
+                        wprob[wn] = dprob[(size_t) wn];
+                        wtok[wn] = drafts[(size_t) wn];
+                        wp2[wn] = mtp.feat_p2[wn];
+                        wh[wn] = mtp.feat_h[wn];
+                    }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
@@ -12924,6 +12945,10 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                if (spec_lookup_q > 0.0 && use_mtp && sfx_on) {   // the history ends with the next window's first token
+                    spec_lk_n = sfx.propose(std::min(8, S_mtp), spec_lk);
+                    mtp.set_stop_hint(spec_lk, spec_lk_n, spec_lookup_q, spec_depth_decay);
+                }
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
@@ -12952,6 +12977,14 @@ int main(int argc, char** argv) {
                     std::fprintf(spec_log, "W %d %d %d %d %d %d %d %.3f %.3f %.3f", first_window_was ? 1 : 0, T, T_mtp, chain_n,
                                  from_sfx ? 1 : 0, a, wn, msd2(round0, Clock::now()), msd2(tw0, tw1), msd2(tw2, Clock::now()));
                     for (int i = 0; i < wn; ++i) std::fprintf(spec_log, " %.4f", wprob[i]);
+                    if (strata::core::MtpDrafter::feat_env()) {   // the draft tokens, runner-up probabilities, entropies
+                        std::fprintf(spec_log, " |");
+                        for (int i = 0; i < wn; ++i) std::fprintf(spec_log, " %d", (int) wtok[i]);
+                        std::fprintf(spec_log, " |");
+                        for (int i = 0; i < wn; ++i) std::fprintf(spec_log, " %.4f", wp2[i]);
+                        std::fprintf(spec_log, " |");
+                        for (int i = 0; i < wn; ++i) std::fprintf(spec_log, " %.4f", wh[i]);
+                    }
                     std::fprintf(spec_log, "\n");
                 }
                 if (timed_round && !eos && chain_n == 0)
