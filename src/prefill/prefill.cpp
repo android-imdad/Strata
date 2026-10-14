@@ -2710,7 +2710,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (path == nullptr) return;
             cudaStreamSynchronize(m.cs);
             static const int64_t every_env = [] { const char* v = std::getenv("STRATA_PF_DUMP_EVERY"); return v ? (int64_t) std::atoll(v) : (int64_t) 64; }();
-            const int64_t ev = tag >= 1000 ? every_env : 64;
+            const int64_t ev = every_env > 0 ? every_env : 64;
             const int64_t t0 = (ev - p0 % ev) % ev;
             if (t0 >= T) return;
             const int64_t rows = (T - t0 + ev - 1) / ev;
@@ -2745,7 +2745,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 constexpr int64_t HD = strata::kernels::NG_HC_DIM;
                 const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2(m.f16_io) ? 4 : 2) + 4096;
                 const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
-                if (std::getenv("STRATA_PF_LAYER_DUMP")) std::fprintf(stderr, "strata debug: PLE sub-batch %lld of chunk %lld\n", (long long) SB, (long long) T);
                 std::vector<std::pair<int64_t, int64_t>> sbs;   // STRATA_PF_PIECE: the sub-batches inside the pieces
                 pf_spans(T, [&](int64_t a0, int64_t an) { for (int64_t b = a0; b < a0 + an; b += SB) sbs.emplace_back(b, std::min(SB, a0 + an - b)); });
                 for (const auto& sb : sbs) {
@@ -2885,16 +2884,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (l == 0) {
-                    pf_buf_dump(1010, m.mixed_h, N * 2, N * 2); pf_buf_dump(1011, m.R, D * 4, D * 4);
-                    const int64_t ldx0 = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() && !m.xn16_lo ? D + XN_PAD : D;
-                    pf_buf_dump(1012, m.xn16, D * 2, ldx0 * 2);
-                    pf_buf_dump(1013, m.lo, LR * 4, LR * 4);
-                    pf_buf_dump(1014, m.gated, D * 4, D * 4);
-                    pf_buf_dump(1015, m.inj, HC * 4, HC * 4);
-                    std::fprintf(stderr, "strata debug: chunk p0 %lld T %lld ldx %lld\n", (long long) p0, (long long) T, (long long) ldx0);
-                }
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
@@ -2907,15 +2897,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                    ld_y);
                     pt.mark(kPfGdnOut, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
-                    if (l == 0) {
-                        pf_buf_dump(1000, m.qkv, C * 4, C * 4);
-                        pf_buf_dump(1001, m.z, ZV * 4, ZV * 4);
-                        pf_buf_dump(1002, m.gate, HV * 4, HV * 4);
-                        pf_buf_dump(1003, m.beta, HV * 4, HV * 4);
-                        pf_buf_dump(1004, m.hbuf, C * 4, C * 4);
-                        pf_buf_dump(1005, m.y_h, ZV * 2, (ld_y > 0 ? ld_y : ZV) * 2);
-                        pf_buf_dump(1006, m.bo, N * 4, N * 4);
-                    }
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
@@ -4072,12 +4053,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         int64_t gx_o0[kGuExactMax] = {};
                         int gx_q[kGuExactMax] = {};
                         int gx_nbuf = 0;   // STRATA_PF_PIECE: the experts (dequantized buffers) the group's entries use
+                        // STRATA_PF_PIECE: the down products of the group's pieces, one per piece (a gate/up entry can
+                        // cover several pieces, the down product's order follows its token count)
+                        std::vector<int64_t> dn_o0, dn_n;
+                        std::vector<int> dn_q;
                         auto gx_flush = [&]() {
                             gx_nbuf = 0;
                             if (gx.n == 0) return;
                             pt.mark(kPfGemmGU, cs);
                             if (!gu_exact_run(gx, m.gu_exact_ws, m.cs))   // (a failed launch: the same products, one call each)
                                 for (int i = 0; i < gx.n; ++i) m.gemm.f16(gx.x[i], gx.w[i], gx.y[i], gx.t[i], 1280, N);
+                            if (!dn_n.empty()) {
+                                for (int i = 0; i < gx.n; ++i)
+                                    swiglu_interleaved(m.GU + gx_o0[i] * 1280, m.Hh + gx_o0[i] * 640, gx.t[i], m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                for (size_t i = 0; i < dn_n.size(); ++i)
+                                    m.gemm.f16(m.Hh + dn_o0[i] * 640, m.dq_d[dn_q[i]], m.Dm + dn_o0[i] * N, dn_n[i], N, 640);
+                                dn_o0.clear(); dn_n.clear(); dn_q.clear();
+                                gx.n = 0;
+                                return;
+                            }
                             for (int i = 0; i < gx.n; ++i) {
                                 const int64_t o0 = gx_o0[i], ne = gx.t[i];
                                 swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
@@ -4103,11 +4098,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 r = r1;
                             }
                             bool dfr[64];
-                            int nd = 0;
-                            for (int i = 0; i < np; ++i) {
+                            for (int i = 0; i < np; ++i)
                                 dfr[i] = m.gu_exact_ok && N == 2560 && pn[i] >= std::max(gx_min, kGuExactMinT) &&
                                          pn[i] <= kGuExactMaxT && m.gemm.f16_on_rocblas(pn[i], 1280, N);
-                                nd += dfr[i];
+                            // gate/up entries: consecutive deferred pieces of 65+ tokens merge into one (that kernel's
+                            // order depends only on the output column, not on the token count or a row's place);
+                            // STRATA_PF_PIECE_MERGE=0 keeps one entry per piece
+                            static const bool merge = [] { const char* v = std::getenv("STRATA_PF_PIECE_MERGE"); return v == nullptr || std::atoi(v) != 0; }();
+                            int64_t eo[64], en[64];
+                            int nd = 0;
+                            for (int i = 0; i < np; ++i) {
+                                if (!dfr[i]) continue;
+                                const bool big = pn[i] >= kGuExactSplitT;
+                                if (merge && big && nd > 0 && en[nd - 1] >= kGuExactSplitT && eo[nd - 1] + en[nd - 1] == po[i] &&
+                                    en[nd - 1] + pn[i] <= kGuExactMaxT && i > 0 && dfr[i - 1] && pn[i - 1] >= kGuExactSplitT) {
+                                    en[nd - 1] += pn[i];
+                                    continue;
+                                }
+                                eo[nd] = po[i]; en[nd] = pn[i]; ++nd;
                             }
                             // at most gu_exact_group() entries a launch, as without pieces (m.gu_exact_ws holds that many)
                             if (nd > gu_exact_group()) { err = "prefill: STRATA_PF_PIECE: more pieces than a GU_EXACT group"; return false; }
@@ -4123,15 +4131,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }
                             if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; m.used_bid[slot] = 0; }
+                            for (int i = 0; i < nd; ++i) {
+                                gx.x[gx.n] = m.Xs + eo[i] * N;
+                                gx.w[gx.n] = m.dq_gu[q];
+                                gx.y[gx.n] = m.GU + eo[i] * 1280;
+                                gx.t[gx.n] = (int) en[i];
+                                gx_o0[gx.n] = eo[i];
+                                gx_q[gx.n] = q;
+                                ++gx.n;
+                            }
                             for (int i = 0; i < np; ++i) {
                                 if (dfr[i]) {
-                                    gx.x[gx.n] = m.Xs + po[i] * N;
-                                    gx.w[gx.n] = m.dq_gu[q];
-                                    gx.y[gx.n] = m.GU + po[i] * 1280;
-                                    gx.t[gx.n] = (int) pn[i];
-                                    gx_o0[gx.n] = po[i];
-                                    gx_q[gx.n] = q;
-                                    ++gx.n;
+                                    dn_o0.push_back(po[i]); dn_n.push_back(pn[i]); dn_q.push_back(q);
                                     continue;
                                 }
                                 pt.mark(kPfGemmGU, cs);
@@ -4327,15 +4338,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);
                     else
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
-                    if (l == 0 && std::getenv("STRATA_PF_LAYER_DUMP")) {
-                        pf_buf_dump(1100, m.mixed_h, N * 2, N * 2);
-                        pf_buf_dump(1101, m.mixed_bf, N * 2, N * 2);
-                        pf_buf_dump(1102, m.logits, m.g->n_expert * 4, m.g->n_expert * 4);
-                        pf_buf_dump(1103, m.w, K * 4, K * 4);
-                        pf_buf_dump(1104, m.shared, N * 4, N * 4);
-                        pf_buf_dump(1105, m.sg, 4, 4);
-                        pf_buf_dump(1106, m.bo, N * 4, N * 4);
-                    }
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
