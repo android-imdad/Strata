@@ -15,12 +15,10 @@ and coding agents. Nothing leaves your PC.
 
 ## This fork: the RX 7900 XTX edition
 
-> This branch is [upstream Strata](https://github.com/Niko1221/Strata) with speedups for the **AMD Radeon RX 7900 XTX**
-> (gfx1100). **The output is bit-identical to upstream:** teacher-forced KL 0.0000, the same token at every position.
-> Nothing trades quality for speed.
+> [Upstream Strata](https://github.com/Niko1221/Strata) tuned for the **AMD Radeon RX 7900 XTX** (gfx1100). **The output
+> is bit-identical to upstream** (teacher-forced KL 0.0000): faster, with nothing traded for quality.
 
-Same PC, same day, same settings, upstream main against this branch (RX 7900 XTX 24 GB, Ryzen 7 9800X3D, 62 GiB RAM,
-Linux, ROCm 10.2, IQ3_S, every output-changing switch off):
+Same PC, same day, same settings (RX 7900 XTX 24 GB, Ryzen 7 9800X3D, Linux, ROCm 10.2, IQ3_S):
 
 | | Upstream | RX 7900 XTX edition | |
 | --- | ---: | ---: | ---: |
@@ -30,7 +28,20 @@ Linux, ROCm 10.2, IQ3_S, every output-changing switch off):
 | Reads a 32K prompt | 1,421 tokens/s | 1,844 tokens/s | **+30%** |
 | Agent turn, first token | 3.90 s | 2.92 s | **-25%** |
 
-How: faster decode kernels (first opened as [PR #2231](https://github.com/Niko1221/Strata/pull/2231)), and the prompt's expert
+Decode is also deterministic: the same question gives the same answer whatever the drafter does (and, with an opt-in
+build, whatever the expert placement). Flags and how it was checked: **[docs/RX7900XTX.md](docs/RX7900XTX.md)**. Thanks to
+**[Niko](https://github.com/Niko1221)** and **[Strata](https://github.com/Niko1221/Strata)**, on which all of this is
+built.
+
+<p align="center"><a href="https://ko-fi.com/imdadismail"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support this fork on Ko-fi" height="48"></a><br>
+<sub>This fork is free. If it runs well on your RX 7900 XTX, a coffee keeps the benchmarking going.</sub></p>
+
+<details>
+<summary><b>Read more:</b> how it works, why it is a fork, thanks</summary>
+
+### How it works
+
+Faster decode kernels (first opened as [PR #2231](https://github.com/Niko1221/Strata/pull/2231)), and the prompt's expert
 products computed in exactly rocBLAS's summation order, but grouped and on a Tensile-generated kernel for this card
 (`STRATA_PF_GU_EXACT=1`), about 2x faster for that step. With `STRATA_IQ_MT_MIN=1` decode is also **deterministic**:
 every token equals one-token-at-a-time decoding whatever the drafter guesses (for a given expert placement), so faster draft policies (prompt lookup
@@ -71,8 +82,7 @@ expert packs, the multi-token drafting and the official benchmark used for every
 decode is upstream's own `STRATA_IQ_MT_MIN` switch. Thanks also to Strata's contributors, and to AMD's ROCm, rocBLAS
 and Tensile, which generated the prompt kernel.
 
-<p align="center"><a href="https://ko-fi.com/imdadismail"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support this fork on Ko-fi"></a><br>
-<sub>This fork is free. If it runs well on your RX 7900 XTX, a coffee keeps the benchmarking going.</sub></p>
+</details>
 
 ## How fast is it?
 
