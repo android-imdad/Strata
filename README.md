@@ -14,18 +14,20 @@ Upstream Strata 0.1.44.1 against this fork (merged with 0.1.44.1), same PC, same
 
 | | Upstream 0.1.44.1 | RX 7900 XTX edition | |
 | --- | ---: | ---: | ---: |
-| Writes answers (short chat) | 86.9 tokens/s | 95.7 tokens/s | **+10%** |
-| First token (short chat) | 1.14 s | 0.84 s | **-26%** |
-| Reads a 4K prompt | 1,045 tokens/s | 1,390 tokens/s | **+33%** |
-| Reads a 16K prompt | 1,356 tokens/s | 1,867 tokens/s | **+38%** |
-| Reads a 32K prompt | 1,371 tokens/s | 1,938 tokens/s | **+41%** |
-| Agent turn, first token | 4.03 s | 3.01 s | **-25%** |
-| Agent session, writes answers | 95.4 tokens/s | 97.7 tokens/s | +2% |
+| Writes answers (short chat) | 88.8 tokens/s | 105.0 tokens/s | **+18%** |
+| First token (short chat) | 1.12 s | 0.82 s | **-27%** |
+| Reads a 4K prompt | 1,081 tokens/s | 1,443 tokens/s | **+33%** |
+| Reads a 16K prompt | 1,397 tokens/s | 1,921 tokens/s | **+37%** |
+| Reads a 32K prompt | 1,406 tokens/s | 1,990 tokens/s | **+42%** |
+| Agent turn, first token | 3.88 s | 2.93 s | **-24%** |
+| Agent session, writes answers | 96.4 tokens/s | 102.5 tokens/s | **+6%** |
 
-The fork runs the settings below, including the opt-in parity build and exact 32K prompt chunks. Upstream runs its
-defaults with every output-changing switch off. Writing speed moves about 5% between runs, so read the decode rows as
-approximate; every prompt and first-token round of the fork beat every round of upstream. Reports:
-[bench/results/2026-10-14-...-0.1.44](bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44/).
+The fork runs the settings below, including the opt-in parity build, exact 32K prompt chunks and the draft rule
+`STRATA_SPEC_CUM=0.5` (engine `d4b184ee`). Upstream runs its defaults with every output-changing switch off. Every
+round of the fork beat every round of upstream in every row; writing speed still moves a few percent between runs.
+Reports: [bench/results/2026-10-14-...-0.1.44-cum](bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44-cum/)
+(the earlier comparison, before `STRATA_SPEC_CUM`:
+[2026-10-14-...-0.1.44](bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44/)).
 
 Decode is also deterministic: the same question gives the same answer whatever the drafter does (and, with an opt-in
 build, whatever the expert placement).

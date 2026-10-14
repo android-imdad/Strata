@@ -11,21 +11,24 @@ Measured on: RX 7900 XTX 24 GB (gfx1100), Ryzen 7 9800X3D, 62 GiB RAM, Linux 7.2
 
 ## Results
 
-`tools/strata_bench.py --long`, same day, alternating rounds, medians of 3 runs per test. Upstream 0.1.44.1 (its
-defaults, every output-changing switch off) against this fork merged with 0.1.44.1 (parts 1-5 with the parity build,
-`STRATA_MTP_HIP_PRIO=1`):
+`tools/strata_bench.py --long`, same day, 3 alternating rounds, medians (each round itself the median of 3 runs per
+test). Upstream 0.1.44.1 (its defaults, every output-changing switch off) against this fork merged with 0.1.44.1
+(parts 1-6 with the parity build, `STRATA_MTP_HIP_PRIO=1`, engine `d4b184ee`):
 
 | Test | Upstream 0.1.44.1 `296b59d2` | This fork | Change |
 | --- | ---: | ---: | ---: |
-| Short chat, writes answers | 86.9 tokens/s | 95.7 tokens/s | **+10%** |
-| Short chat, first token | 1.14 s | 0.84 s | **-26%** |
-| 4K prompt, reads | 1,045 tokens/s | 1,390 tokens/s | **+33%** |
-| 16K prompt, reads | 1,356 tokens/s | 1,867 tokens/s | **+38%** |
-| 32K prompt, reads | 1,371 tokens/s | 1,938 tokens/s | **+41%** |
-| Agent session, first token per turn | 4.03 s | 3.01 s | **-25%** |
-| Agent session, writes answers | 95.4 tokens/s | 97.7 tokens/s | +2% |
+| Short chat, writes answers | 88.8 tokens/s | 105.0 tokens/s | **+18%** |
+| Short chat, first token | 1.12 s | 0.82 s | **-27%** |
+| 4K prompt, reads | 1,081 tokens/s | 1,443 tokens/s | **+33%** |
+| 16K prompt, reads | 1,397 tokens/s | 1,921 tokens/s | **+37%** |
+| 32K prompt, reads | 1,406 tokens/s | 1,990 tokens/s | **+42%** |
+| Agent session, first token per turn | 3.88 s | 2.93 s | **-24%** |
+| Agent session, writes answers | 96.4 tokens/s | 102.5 tokens/s | **+6%** |
 
-Reports: [bench/results/2026-10-14-...-0.1.44](../bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44/).
+Every round of the fork beat every round of upstream in every row. Reports:
+[bench/results/2026-10-14-...-0.1.44-cum](../bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44-cum/); the
+same comparison before part 6 (short chat +10%, agent sessions +2%):
+[2026-10-14-...-0.1.44](../bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44/).
 Merging 0.1.44.1 changed none of this fork's output (kl.py: 2,557 positions identical, perplexity 4.447 = 4.447, with
 8K and with exact 32K chunks), and decode did not get slower: with the same drafts on both engines (5 paired rounds,
 3,580 windows, every reply identical) the merged engine takes 30.49 ms a window against 30.75 before it. Regular
