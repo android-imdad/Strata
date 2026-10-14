@@ -185,7 +185,7 @@ prompt is read). `STRATA_PF_GU_TENSILE=0` keeps the 65+ token experts on gu_exac
 ## Limits
 
 Why this is a fork rather than an upstream pull request, and thanks to Strata: see the
-[README](../README.md#why-this-is-a-fork-and-not-merged-upstream).
+[README](../README.md#why-a-fork-and-not-merged-upstream).
 
 - Measured on one PC. The Tensile kernel is gfx1100 only; other cards keep gu_exact's own kernels, which follow
   rocBLAS's fallback order generally but were only checked here.
