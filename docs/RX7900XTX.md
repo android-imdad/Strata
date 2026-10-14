@@ -146,6 +146,11 @@ This part makes the CPU compute exactly what the GPU computes:
 The switch turns itself off (and says why in the log) without AVX-512, if a layer's format is not in the replica, or on a
 GPU build without `-DSTRATA_SWIGLU_SEXP`. Without the switch nothing changes.
 
+The replica reads IQ3_S grid entries with one AVX-512 gather per 64 weights instead of 16 scalar loads: the same table
+values, so the same integer sums (`expert_replica` on all ten IQ3_S layers: 0 of 10,240 outputs differ from the GPU).
+That kernel was bound by the scalar loads; with the gather the CPU expert time per decode window is 3.5% lower and
+writing answers +0.3-0.4% (only 10 of the 48 layers are IQ3_S). `STRATA_REPLICA_GATHER=0` keeps the scalar loads.
+
 Checked with kl.py (2,557 positions, slots pinned): with parity on, 7,200 slots against 7,150 / 7,000 / 6,500 slots
 gives identical log-probabilities, 100% same top token, perplexity 4.447 at every placement (without parity the
 placements disagree). With `--kv-resident 32768` against without it, also identical: perplexity 4.447 = 4.447. Together with part 3 the reply
@@ -236,6 +241,13 @@ Measured on this card (verify windows logged with `STRATA_SPEC_LOG=<file>`):
 
 Every round with the rule beat every round without it, in both tests.
 
+A further opt-in, `STRATA_SPEC_LOOKUP_Q=0.95` + `STRATA_SPEC_DEPTH_DECAY=0.9` (with `STRATA_SPEC_CUM=0.3` and
+`--spec-min-p 0.01`), counts a draft that the suffix lookup (prompt + output so far) also proposes as 0.95 and discounts
+deeper drafts. A logistic fit over 1,167 logged windows ranked the lookup's agreement as the strongest sign that a draft
+holds (the runner-up's probability and the entropy added nothing), and without the lookup chain it was +1.4% / +5.8%
+on two prompt sets. With `--lookup-chain 3` and suffix drafts, which already use the lookup, the official benchmark
+was a wash (short chat -2.5%, agent sessions +0.8%, 3 rounds), so it is not in the settings above.
+
 ### Tried on this card and not kept
 
 - **Prefetching the next layer's experts.** Upstream's look-ahead (`RouterLookahead`: the next layer's router applied
@@ -251,6 +263,12 @@ Every round with the rule beat every round without it, in both tests.
   and intercept queues (an HSA tools library) stall the decode window, so it is not used.
 - **A cheaper draft layer.** `--mtp-q4 all`: drafts held less often, decode -7%. `--mtp-draft-vocab
   data/draft_vocab_en.bin`: drafting 16% faster with the same acceptance, decode within noise.
+- **The adaptive tier's swap budget.** `--adapt-swaps` 160 / 80 / 40 decode the same within noise (fewer swaps wait
+  less for their copies but leave more experts to the CPU); 0 (no adaptive tier) is 24% slower.
+- **More expert slots.** `--vram-reserve-mib` 1024 / 768 / 512 gives 8,811 / 8,943 / 9,074 slots and +0.4% / +0.8%
+  decode: the hit rate is already about 90%, so not worth less headroom for the desktop.
+- **The hyper-connection down product on more blocks.** 4 or 2 rows a block instead of 8 (80 / 160 blocks, the same
+  per-row arithmetic): -1.6% / -8%, because every block stages the activations again.
 
 ## Use it
 
