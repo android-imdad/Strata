@@ -43,7 +43,8 @@ every token equals one-token-at-a-time decoding whatever the drafter guesses (fo
 for code rewrites, +8%) change only the speed. An opt-in build (`-DSTRATA_SWIGLU_SEXP` + `STRATA_CPU_PARITY=1`) makes
 the CPU's expert rows bit-identical to the GPU's, so the output no longer depends on expert placement either; that
 shifts the output once (perplexity 4.425 -> 4.469) and lets `--kv-resident 32768` free VRAM for agent sessions with
-identical output (+8% agent decode). Details, flags and how it was checked:
+identical output (+8% agent decode). `STRATA_SPEC_CUM=0.5` keeps drafts while the whole chain is likely to hold
+(+6.4% short chat, +2.1% agent decode, same output). Details, flags and how it was checked:
 **[docs/RX7900XTX.md](docs/RX7900XTX.md)**.
 
 </details>
@@ -106,6 +107,10 @@ and to `args`, for deterministic decode with faster drafting:
 
 With the parity build, also add `"STRATA_CPU_PARITY": "1"` to `env` and `"--kv-resident", "32768"` to `args`
 (+8% decode in agent sessions).
+
+Faster drafting with the same output: add `"STRATA_SPEC_CUM": "0.5"` to `env`. Drafts are kept while the chance that
+the whole chain of drafts holds stays at 0.5 or more, instead of judging each draft on its own: short chat **+6.4%**,
+agent sessions **+2.1%** writing answers (official benchmark, 3 alternating rounds, every round faster).
 
 Optional, from upstream 0.1.44: `"STRATA_MTP_HIP_PRIO": "1"` gives the drafter its own GPU queue (agent decode +3% in one
 benchmark, short chat within noise - inside the run-to-run spread, so not a proven gain; the output does not change). Do not set `STRATA_COPY_HIP_PRIO=1` on this card: it

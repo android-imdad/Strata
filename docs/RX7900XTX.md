@@ -208,6 +208,50 @@ Speed (prompt reading, with parts 1-4):
 About half of the plain 32K gain stays: experts whose pieces get 2-64 tokens must keep the slower 3-split order the
 8K reference uses, and the down product runs per piece. Writing answers is unchanged.
 
+### 6. Drafts kept while the whole chain is likely to hold (`STRATA_SPEC_CUM=0.5`)
+
+`--spec-min-p 0.5` keeps a draft in the verify window while that draft's own probability (from the draft layer) is at
+least 0.5. A window costs more for every token it carries, though, and a draft only counts if every draft before it was
+accepted too. `STRATA_SPEC_CUM=S` keeps drafts while the product of the probabilities so far (the chance that the whole
+chain holds) is at least `S`, and the drafter stops at the same point. With part 3 the output does not depend on the
+drafts, so this changes only the speed.
+
+Measured on this card (verify windows logged with `STRATA_SPEC_LOG=<file>`):
+
+- A window costs 11.2 ms plus 2.4 ms per verified token, a draft step 0.74 ms. The draft layer is well calibrated for
+  its first draft and overconfident after it (second drafts at probability 0.8-0.9 held 57% of the time).
+- Replayed over 604 full-depth windows: `--spec-min-p 0.5` 115.8 tokens/s (model), the cumulative rule at 0.5 118.0,
+  at 0.4 with probabilities calibrated per draft depth 119.6, a perfect stop (knowing which drafts hold) 140.6. The
+  draft layer's probabilities are what limits any such rule.
+- Six 1,000-token prompts x 300 tokens, no lookup chain, the same tokens in every run, 3 alternating rounds (medians):
+  104.09 -> 105.94 tokens/s (+1.8%). The calibrated variant (`STRATA_SPEC_CAL=1`, calibration learned while serving)
+  was not better (+0.3% to +1.3%).
+- `tools/strata_bench.py`, the settings above with `--lookup-chain 3`, 3 alternating rounds (medians):
+
+| Test | `--spec-min-p 0.5` | + `STRATA_SPEC_CUM=0.5` | Change |
+| --- | ---: | ---: | ---: |
+| Short chat, writes answers | 96.3 tokens/s | 102.5 tokens/s | **+6.4%** |
+| Agent session, writes answers | 97.2 tokens/s | 99.2 tokens/s | **+2.1%** |
+| Prompts, first tokens | | | unchanged |
+
+Every round with the rule beat every round without it, in both tests.
+
+### Tried on this card and not kept
+
+- **Prefetching the next layer's experts.** Upstream's look-ahead (`RouterLookahead`: the next layer's router applied
+  to this layer's MoE input) and Foresight swap space (`STRATA_FS_SLOTS`) run on HIP, with the same output. Here they
+  were 3-4% slower: the prediction covers only 31-37% of the missed experts at about 4 copies per layer (precision
+  0.35-0.48; this model's hyper-connections change the router input a lot from layer to layer), the predictor thread
+  slows the CPU pool, and every 1.9 MB copy during a window adds about 14 us to the GPU's path (its reads of host
+  memory slow down beside DMA). `STRATA_ROUTE_DUMP=<file>` writes the routing for offline scoring;
+  `STRATA_FS_TAKE_FIRST=1` makes a landed slot take a CPU expert's place instead of a PCIe one's (better, still slower).
+- **Cheaper kernel launches.** A dependent kernel in a HIP graph costs 2.8 us here, and raw AQL packets with the cache
+  fence the kernel needs cost the same (HIP graphs already pre-build their packets). Without the queue's acquire fence a
+  kernel costs 2.2 us and stays correct only if it invalidates its own caches first. HIP has no switch for that fence,
+  and intercept queues (an HSA tools library) stall the decode window, so it is not used.
+- **A cheaper draft layer.** `--mtp-q4 all`: drafts held less often, decode -7%. `--mtp-draft-vocab
+  data/draft_vocab_en.bin`: drafting 16% faster with the same acceptance, decode within noise.
+
 ## Use it
 
 Build the HIP engine for gfx1100 (the interleaved-copy path needs `-DSTRATA_HIP_MMVQ_IL`):
@@ -232,6 +276,7 @@ Then add to the `env` of your `strata-*.json` (all bit-exact):
 and, for deterministic decode with faster drafting, set its `args` to `--spec 6 --spec-min-p 0.5 --lookup-chain 3`.
 With the part 4 build, also `"STRATA_CPU_PARITY": "1"` in `env` and `--kv-resident 32768` in `args`.
 For part 5, `"STRATA_PF_PIECE": "8192"` in `env` and `--prefill auto:32768` in place of `--prefill auto` in `args`.
+For part 6, `"STRATA_SPEC_CUM": "0.5"` in `env` (keep `--spec-min-p 0.5`).
 
 The log says whether it is on:
 
