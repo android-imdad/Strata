@@ -15,6 +15,7 @@
 #include <immintrin.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace strata::kernels::cpu::replica {
@@ -26,10 +27,21 @@ inline uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); retur
 inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
 
 // ---- 64 values (chunk j of a 256-value block) -> grid magnitudes and a sign mask (iq_avx512.cpp's decode)
+// IQ3_S: the 16 grid entries of a chunk by one vpgatherdd instead of 16 scalar loads - the same table values, so the
+// same integer sums; the scalar loads bound this kernel (Zen 5, 8 threads: 49 -> 60 GB/s of weights in a scratch
+// benchmark).  STRATA_REPLICA_GATHER=0 keeps the scalar loads.
+const bool g_iq3s_gather = [] { const char* e = std::getenv("STRATA_REPLICA_GATHER"); return !(e != nullptr && e[0] == '0'); }();
 template <int TY> struct Dec;
 template <> struct Dec<21> {   // IQ3_S
     static constexpr int bytes = 110;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m) {
+        if (g_iq3s_gather) {
+            const __m512i idx = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) (b + 2 + 16 * j)));
+            const __mmask16 hi = (__mmask16) (b[66 + 2 * j] | (b[66 + 2 * j + 1] << 8));   // bit k: index k's 9th bit
+            g = _mm512_i32gather_epi32(_mm512_mask_add_epi32(idx, hi, idx, _mm512_set1_epi32(256)), (const void*) iq3s_grid, 4);
+            m = _cvtu64_mask64(u64(b + 74 + 8 * j));
+            return;
+        }
         const uint8_t* q = b + 2 + 16 * j;
         const uint32_t h0 = b[66 + 2 * j], h1 = b[66 + 2 * j + 1];
 #define G3(k, h, kk) (int) iq3s_grid[q[k] | (((h >> kk) & 1) << 8)]
