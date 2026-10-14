@@ -147,6 +147,46 @@ last 32K tokens of KV in VRAM and frees it for ~1,600 more expert slots (8,798 a
 Parity alone costs nothing measurable. With `--kv-resident` every agent round (105.4-108.0) beat the best baseline round
 (103.7); chat decode was flat in this run (+4% in an earlier sweep).
 
+### 5. Larger prompt chunks with the same bits (`--prefill auto:32768` + `STRATA_PF_PIECE=8192`)
+
+Reading a prompt in 32K-token chunks instead of 8K is faster, mostly because every expert that is not in VRAM is
+copied and dequantized once per chunk. But it changes the output (perplexity 4.447 -> 4.469), for three reasons
+found by hashing every row's hidden state after every half layer (`STRATA_PF_LAYER_DUMP`):
+
+1. **Dense products depend on a row's place in the launch.** hipBLASLt / rocBLAS stagger their summation order by
+   row tile, so a token at row 9,000 of a 32K launch gets other bits than at row 808 of an 8K one.
+2. **Expert products depend on how many tokens the expert gets** (the exact gate/up kernel's order class, the down
+   product's tile placement).
+3. **The server reads a prompt in segments ending at its checkpoints**, so 8K chunks are counted from each
+   segment's start, not from token 0.
+
+`STRATA_PF_PIECE=P` keeps the large chunk but computes in P-token pieces at exactly the row offsets P-token chunks
+have: dense products launch per piece; each expert is dequantized once and multiplies each piece's tokens with the
+calls a P-token chunk makes (consecutive pieces of 65+ tokens share one gate/up launch: that kernel's order depends
+only on the output column; the down product stays per piece, `tools/hip/pf_piece/down_order_check` shows hipBLASLt's
+solution 2106 keeps a row's bits only where `(row / 96) % 4` is unchanged); the PLE block's sub-batches follow the
+pieces. Conversation checkpoints that P-token chunks would have made inside a large chunk (every
+`--prompt-cache-every` tokens) are taken there too, so a new prompt that shares a prefix with an earlier one resumes
+from the same place.
+
+Checked against `--prefill auto` (8K chunks), same build, slots pinned:
+
+- kl.py: 2,557 positions identical, perplexity 4.447 = 4.447.
+- Through the server with images and a control vector: 36 tool calls, 2 images, 18.8K / 35.9K / 51.1K-token
+  documents and their follow-up turns, 44/44 replies byte-identical; the checkpoints at 16,384 / 32,768 / 49,152
+  hash the same (`STRATA_CKPT_HASH=1`) and the prefix reuse is the same.
+
+Speed (prompt reading, with parts 1-4):
+
+| Prompt | 8K chunks | 32K + `STRATA_PF_PIECE=8192` | 32K plain (perplexity 4.469) |
+| --- | ---: | ---: | ---: |
+| fresh 32K prompt | 21.8 s | 18.8-19.3 s (**+13-16%**) | 16.9 s |
+| 18.8K-token document (server) | 13.3 s | 12.0 s (**+11%**) | - |
+| 48K continuation | 31.4 s | 28.2-29.1 s (**+8-11%**) | 26.1 s |
+
+About half of the plain 32K gain stays: experts whose pieces get 2-64 tokens must keep the slower 3-split order the
+8K reference uses, and the down product runs per piece. Writing answers is unchanged.
+
 ## Use it
 
 Build the HIP engine for gfx1100 (the interleaved-copy path needs `-DSTRATA_HIP_MMVQ_IL`):
@@ -170,6 +210,7 @@ Then add to the `env` of your `strata-*.json` (all bit-exact):
 
 and, for deterministic decode with faster drafting, set its `args` to `--spec 6 --spec-min-p 0.5 --lookup-chain 3`.
 With the part 4 build, also `"STRATA_CPU_PARITY": "1"` in `env` and `--kv-resident 32768` in `args`.
+For part 5, `"STRATA_PF_PIECE": "8192"` in `env` and `--prefill auto:32768` in place of `--prefill auto` in `args`.
 
 The log says whether it is on:
 
@@ -192,5 +233,7 @@ Why this is a fork rather than an upstream pull request, and thanks to Strata: s
   rocBLAS's order changes, the feature turns itself off.
 - Not built for CUDA or SYCL. The new code is HIP-only and compiles to stubs elsewhere.
 - Decode is unchanged by part 2; its gains are part 1's.
+- Part 5 reproduces 8K chunks (`STRATA_PF_PIECE` must equal the chunk the reference reads with: 8192 = `--prefill
+  auto` here). Single GPU only: a layer split or peer GPU takes no checkpoints inside a chunk.
 - Part 4 needs AVX-512 (VNNI) on the CPU and was checked only for this model's formats. Its replica follows the GPU
   kernels' order as built here; a change to those kernels needs the `expert_replica` check again.

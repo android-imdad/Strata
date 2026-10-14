@@ -99,6 +99,10 @@ and to `args`, for deterministic decode with faster drafting:
 With the parity build, also add `"STRATA_CPU_PARITY": "1"` to `env` and `"--kv-resident", "32768"` to `args`
 (+8% decode in agent sessions).
 
+Faster long prompts with the same output: add `"STRATA_PF_PIECE": "8192"` to `env` and change `"--prefill", "auto"` to
+`"--prefill", "auto:32768"` in `args`. Prompts are read in 32K chunks but computed exactly as 8K chunks, so the output
+and the conversation checkpoints are bit-identical: a fresh 32K prompt +13-16%, long documents +10-12%.
+
 The engine's log (`strata-<model>.log`) shows that they are on:
 
 ```
@@ -120,7 +124,7 @@ For scale: before the parity build, shifting only 200 expert slots moved perplex
 | Switch | Perplexity | Same top token | 16K prompt read | 48K prompt read |
 | --- | ---: | ---: | ---: | ---: |
 | exact (the settings above) | 4.447 | 100% | - | - |
-| `--prefill auto:32768` (`args`): 32K prompt chunks instead of 8K | 4.469 | 96.2% | **+13%** | **+21%** |
+| `--prefill auto:32768` (`args`): 32K prompt chunks instead of 8K (with `STRATA_PF_PIECE=8192`: 4.447, exact, about half the gain) | 4.469 | 96.2% | **+13%** | **+21%** |
 | `STRATA_HIP_WMMA=1` + `STRATA_SELECT_WMMA=1` + `STRATA_PA_FAST=1` (`env`): prompt attention on the matrix cores | 4.492 | 95.9% | **+11%** | **+16%** |
 | `STRATA_HC_UPMIX=1` + `STRATA_PF_SWITCH_MIN_T=4096` (`env`) | 4.501 | 94.7% | +2% | -1% |
 | `STRATA_PF_GEMM=1` + `STRATA_PF_SWITCH_MIN_T=4096` (`env`) | 4.508 | 94.2% | **-21%** | **-21%** |
