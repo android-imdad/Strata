@@ -109,6 +109,28 @@ strata generate: STRATA_CPU_PARITY: on (the CPU expert rows in the GPU's arithme
 If a check fails at start-up (another ROCm, another GPU), the feature turns itself off and the log says why. Every
 switch, how each one was checked and its limits: **[docs/RX7900XTX.md](docs/RX7900XTX.md)**.
 
+## More speed, if you accept a small change in output
+
+The settings above are all exact. The switches below are faster but change the output slightly, so it is no longer
+bit-identical to upstream. KL is the teacher-forced divergence from the exact engine: about 0.01 is the size of the
+drift that expert placement alone caused before the parity build. For comparison, the parity build's one-time shift
+is 0.016.
+
+| Switch | What it does | KL | Speed |
+| --- | --- | ---: | --- |
+| `STRATA_HC_Q8=1` + `STRATA_HC_Q8_BF16=1` (`env`) | decode reads the hyper-connection weights as 8-bit | 0.0128 | decode +5.5% |
+| `STRATA_HIP_WMMA=1` + `STRATA_SELECT_WMMA=1` + `STRATA_PA_FAST=1` (`env`) | prompt attention on the matrix cores | 0.0136 | prompts +15% (4K) to +41% (128K) |
+| `STRATA_PF_GEMM=1`, `STRATA_PF_FUSED=1`, `STRATA_HC_UPMIX=1` (`env`) | faster prompt-path GEMMs and fused kernels | 0.0115 each | prompts |
+| `STRATA_PREFILL_CPU_SHARE=auto` (`env`) | the CPU takes some experts of short prompt chunks | 0.0175 | agent tool-result reads (200-1,000 tokens) -34% to -54% time |
+| `--prefill auto:32768` (`args`) | 32K prompt chunks instead of 8K | 0.0088 | prompts of 32K and longer |
+
+Together, `HC_Q8`, `PF_GEMM`, `PF_FUSED`, `HC_UPMIX` and 32K chunks were worth +9% decode and +7% (1K) to +22% (128K)
+on prompts. These numbers come from an earlier engine of this fork, before `STRATA_PF_GU_EXACT` and the parity build.
+Their gain on top of the current exact settings has not been measured again, so run `./bench.sh` with and without
+them. Each switch is a single `env` or `args` entry; remove it to go back to exact output.
+
+Never set `STRATA_FUSE_HEAD_GR=1`. On this card it breaks the model (perplexity 15).
+
 ## Run and measure
 
 Start it with `./setup.sh` as usual. The app opens at `http://127.0.0.1:8080`, and apps and coding agents connect to
