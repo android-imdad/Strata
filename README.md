@@ -71,6 +71,9 @@ expert packs, the multi-token drafting and the official benchmark used for every
 decode is upstream's own `STRATA_IQ_MT_MIN` switch. Thanks also to Strata's contributors, and to AMD's ROCm, rocBLAS
 and Tensile, which generated the prompt kernel.
 
+<p align="center"><a href="https://ko-fi.com/imdadismail"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support this fork on Ko-fi"></a><br>
+<sub>This fork is free. If it runs well on your RX 7900 XTX, a coffee keeps the benchmarking going.</sub></p>
+
 ## How fast is it?
 
 We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
