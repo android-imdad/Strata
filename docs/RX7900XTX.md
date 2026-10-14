@@ -1,8 +1,8 @@
 # RX 7900 XTX (gfx1100) edition
 
 This branch (`rx7900xtx`) is upstream Strata plus speedups measured on one AMD Radeon RX 7900 XTX. Every change keeps
-the model's output **bit-identical**: teacher-forced KL against the engine without them is 0.0000, with the same top
-token at every position. Nothing here trades quality for speed. The one exception is opt-in and built separately:
+the model's output **bit-identical**: reading the same texts, the engine with them gives the same log-probabilities
+and the same top token at every position as the engine without them, so the same perplexity. Nothing here trades quality for speed. The one exception is opt-in and built separately:
 part 4 (`-DSTRATA_SWIGLU_SEXP` + `STRATA_CPU_PARITY=1`) shifts the output once against today's engine so that from then
 on it no longer depends on where the experts sit.
 
@@ -28,7 +28,7 @@ Reports: [upstream and PR #2231](../bench/results/2026-10-13-community-rx-7900-x
 first-token rows every round of this branch beat every round of the engine it was compared with; decode moves a few
 percent between runs (the drafts follow measured timings), so read its rows as approximate.
 
-The config is a strict one: every switch that changes the output (KL > 0) is off, including upstream's own opt-in
+The config is a strict one: every switch that changes the output (even slightly) is off, including upstream's own opt-in
 ones (`STRATA_HC_Q8`, `STRATA_PF_GEMM`, `STRATA_PF_FUSED`, WMMA prompt attention). With those on, both engines are
 faster and no longer identical to each other.
 
@@ -46,7 +46,7 @@ dequant of Q6_K / IQ4_XS. On by default, each with an `=0` switch; plus opt-ins 
 In a prompt about half the GPU time is the routed experts' gate/up product (FP16 x FP16 -> FP32, 1280 x 2560 per
 expert). It has no hipBLASLt tuning, so it falls back to rocBLAS's generic Tensile kernels, which do not use the matrix
 cores and reach 6-13 TFLOPS on this card. Any faster kernel adds the products in another order, which changes the
-output a little (that is why `STRATA_PF_GEMM` has KL 0.0115).
+output a little (that is why `STRATA_PF_GEMM` moves perplexity from 4.486 to 4.506).
 
 This branch reproduces rocBLAS's order instead. Read from its kernels and checked bit for bit:
 
@@ -73,18 +73,17 @@ How it was checked:
   4,100), with a negative control that must differ (it does).
 - At every start: the grouped kernels against the engine's own `Gemm::f16` call at 25 token counts, bit for bit. A
   difference, a different GEMM path or another GPU turns the feature off and says so in the log.
-- In the engine: kl.py (2,557 positions after 16K / 16K / 64K prompt reads) KL 0.0000, 100% same top token; the
+- In the engine: kl.py (2,557 positions after 16K / 16K / 64K prompt reads) identical log-probabilities and perplexity, 100% same top token; the
   session-state fingerprint after short prompts identical.
 
 ### 3. Deterministic decode: the same tokens whatever the drafter does (`STRATA_IQ_MT_MIN=1`)
 
 Strata verifies the drafter's guesses in windows of 1-8 tokens, and the window a token lands in follows the drafts, which
 follow measured timings. Without this switch a token's logits depend on its window: reading the same text through windows
-of 2, 3 or 4 tokens instead of 1 gives KL 0.010-0.015 (max 8 at single positions), so the same prompt can give a slightly
-different reply from run to run. The cause on this card is the CPU expert rows, which were grouped by window.
+of 2, 3 or 4 tokens instead of 1 gives slightly different log-probabilities, so the same prompt can give a slightly different reply from run to run. The cause on this card is the CPU expert rows, which were grouped by window.
 
 Upstream's `STRATA_IQ_MT_MIN=1` computes every CPU row independently of the window. With it, teacher-forced reading
-through windows of **1, 2, 3, 4, 5, 6 and 8 tokens gives byte-identical log-probabilities** (2,557 positions, KL 0.0000,
+through windows of **1, 2, 3, 4, 5, 6 and 8 tokens gives byte-identical log-probabilities** (2,557 positions, the same perplexity,
 the same 36 GDN layer states), so every token is exactly what one-token-at-a-time decoding would give: the reply no
 longer depends on the drafts or on timing. It can still change when the expert placement changes (how many experts fit
 in VRAM, which other programs' VRAM use can shift by a few slots), because an expert computed on the CPU differs from the
@@ -110,7 +109,7 @@ The reference this matches is one-token decoding, not the engine without the swi
 Each routed expert runs either on the GPU (from VRAM or over PCIe) or on the CPU, and today the two give results that
 differ in the last bits. So the reply depends on the placement: how many expert slots fit in VRAM (other programs' VRAM
 use moves it by a few slots), the adaptive tier's swaps, and VRAM-saving options such as `--kv-resident`. On the same
-engine, moving 50 / 200 slots gives KL 0.0115 / 0.0176.
+engine, moving 50 / 200 slots moves perplexity from 4.425 to 4.461 / 4.419.
 
 This part makes the CPU compute exactly what the GPU computes:
 
@@ -127,12 +126,12 @@ The switch turns itself off (and says why in the log) without AVX-512, if a laye
 GPU build without `-DSTRATA_SWIGLU_SEXP`. Without the switch nothing changes.
 
 Checked with kl.py (2,557 positions, slots pinned): with parity on, 7,200 slots against 7,150 / 7,000 / 6,500 slots
-gives KL 0.0000, 100% same top token, perplexity 4.447 at every placement (without parity: KL 0.0164). With
-`--kv-resident 32768` against without it, also KL 0.0000 and perplexity 4.447 = 4.447. Together with part 3 the reply
+gives identical log-probabilities, 100% same top token, perplexity 4.447 at every placement (without parity the
+placements disagree). With `--kv-resident 32768` against without it, also identical: perplexity 4.447 = 4.447. Together with part 3 the reply
 no longer depends on the drafts, the timing, the expert placement or VRAM use.
 
-**The cost:** the new exponential rounds differently from `__expf`, a one-time shift against today's output: KL 0.0159,
-96.6% same top token, perplexity 4.425 -> 4.469, the same size as the placement drift above (perplexity 4.419-4.461).
+**The cost:** the new exponential rounds differently from `__expf`, a one-time shift against today's output: perplexity
+4.425 -> 4.469, 96.6% same top token, the same size as the placement drift above (perplexity 4.419-4.461).
 Tool calls: 36/36 valid with and without it.
 
 **The gain:** placement becomes a free speed setting, like the drafts in part 3. `--kv-resident 32768` keeps only the

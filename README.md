@@ -6,7 +6,7 @@ RX 7900 XTX (gfx1100) · Linux · ROCm · free and open source</p>
 
 [Strata](https://github.com/Niko1221/Strata) runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**,
 a 125-billion-parameter model, on one gaming PC. This fork tunes it for the RX 7900 XTX. Every speedup keeps the output
-**bit-identical** to upstream (teacher-forced KL 0.0000, the same token at every position): faster, with nothing traded
+**bit-identical** to upstream (the same log-probabilities and the same token at every position, so the same perplexity): faster, with nothing traded
 for quality. The one exception is an opt-in build, described under [Install](#install).
 
 Same PC, same day, same settings (RX 7900 XTX 24 GB, Ryzen 7 9800X3D, 62 GiB RAM, Linux, ROCm 10.2, IQ3_S):
@@ -34,8 +34,8 @@ products computed in exactly rocBLAS's summation order, but grouped and on a Ten
 every token equals one-token-at-a-time decoding whatever the drafter guesses (for a given expert placement), so faster draft policies (prompt lookup
 for code rewrites, +8%) change only the speed. An opt-in build (`-DSTRATA_SWIGLU_SEXP` + `STRATA_CPU_PARITY=1`) makes
 the CPU's expert rows bit-identical to the GPU's, so the output no longer depends on expert placement either; that
-shifts the output once (KL 0.016, perplexity 4.425 -> 4.469) and lets `--kv-resident 32768` free VRAM for agent
-sessions at KL 0 (+8% agent decode). Details, flags and how it was checked:
+shifts the output once (perplexity 4.425 -> 4.469) and lets `--kv-resident 32768` free VRAM for agent sessions with
+identical output (+8% agent decode). Details, flags and how it was checked:
 **[docs/RX7900XTX.md](docs/RX7900XTX.md)**.
 
 </details>
@@ -72,7 +72,7 @@ cmake --build build-hip --target strata
 ```
 
 For the placement parity build, add `-DSTRATA_SWIGLU_SEXP` to `CMAKE_HIP_FLAGS` and use another build directory (for
-example `build-sexp`). It shifts the output once against the other builds (KL 0.016, perplexity 4.425 -> 4.469), so
+example `build-sexp`). It shifts the output once against the other builds (perplexity 4.425 -> 4.469), so
 keep both if you want to compare.
 
 **3. Point the config at it.** In `strata-<model>.json`, set `"exe"` to the engine you built
@@ -112,17 +112,19 @@ switch, how each one was checked and its limits: **[docs/RX7900XTX.md](docs/RX79
 ## More speed, if you accept a small change in output
 
 The settings above are all exact. The switches below are faster but change the output slightly, so it is no longer
-bit-identical to upstream. KL is the teacher-forced divergence from the exact engine: about 0.01 is the size of the
-drift that expert placement alone caused before the parity build. For comparison, the parity build's one-time shift
-is 0.016.
+bit-identical to upstream. Perplexity (lower is better) is measured over 2,557 positions of code and docs after 16K,
+16K and 64K prompts. For scale: before the parity build, a shift of only 200 expert slots in VRAM moved the same
+engine's perplexity between 4.419 and 4.461, so changes of a few hundredths are within that range.
 
-| Switch | What it does | KL | Speed |
+| Switch | What it does | Perplexity, without -> with | Speed |
 | --- | --- | ---: | --- |
-| `STRATA_HC_Q8=1` + `STRATA_HC_Q8_BF16=1` (`env`) | decode reads the hyper-connection weights as 8-bit | 0.0128 | decode +5.5% |
-| `STRATA_HIP_WMMA=1` + `STRATA_SELECT_WMMA=1` + `STRATA_PA_FAST=1` (`env`) | prompt attention on the matrix cores | 0.0136 | prompts +15% (4K) to +41% (128K) |
-| `STRATA_PF_GEMM=1`, `STRATA_PF_FUSED=1`, `STRATA_HC_UPMIX=1` (`env`) | faster prompt-path GEMMs and fused kernels | 0.0115 each | prompts |
-| `STRATA_PREFILL_CPU_SHARE=auto` (`env`) | the CPU takes some experts of short prompt chunks | 0.0175 | agent tool-result reads (200-1,000 tokens) -34% to -54% time |
-| `--prefill auto:32768` (`args`) | 32K prompt chunks instead of 8K | 0.0088 | prompts of 32K and longer |
+| `STRATA_HC_Q8=1` + `STRATA_HC_Q8_BF16=1` (`env`) | decode reads the hyper-connection weights as 8-bit | 4.486 -> 4.488 | decode +5.5% |
+| `STRATA_HIP_WMMA=1` + `STRATA_SELECT_WMMA=1` + `STRATA_PA_FAST=1` (`env`) | prompt attention on the matrix cores | 4.455 -> 4.460 | prompts +15% (4K) to +41% (128K) |
+| `STRATA_PF_GEMM=1` (`env`) | faster prompt-path GEMMs | 4.486 -> 4.506 | prompts |
+| `STRATA_PF_FUSED=1` (`env`) | fused prompt-path kernels | 4.486 -> 4.455 | prompts |
+| `STRATA_HC_UPMIX=1` (`env`) | fused hyper-connection up + mix in prompts | 4.486 -> 4.533 | prompts |
+| `STRATA_PREFILL_CPU_SHARE=auto` (`env`) | the CPU takes some experts of short prompt chunks | 4.461 -> 4.470 | agent tool-result reads (200-1,000 tokens) -34% to -54% time |
+| `--prefill auto:32768` (`args`) | 32K prompt chunks instead of 8K | 4.486 -> 4.492 | prompts of 32K and longer |
 
 Together, `HC_Q8`, `PF_GEMM`, `PF_FUSED`, `HC_UPMIX` and 32K chunks were worth +9% decode and +7% (1K) to +22% (128K)
 on prompts. These numbers come from an earlier engine of this fork, before `STRATA_PF_GU_EXACT` and the parity build.
@@ -152,13 +154,13 @@ everything else, see [upstream's issues](https://github.com/Niko1221/Strata/issu
   kernels, and nothing guarantees that order: a ROCm update can change it (a check at start-up then turns the feature
   off). Upstream would carry a kernel that its maintainers cannot test or regenerate without this card and a patched
   Tensile setup.
-- **Part of it changes the output on purpose.** CPU/GPU expert parity shifts the output once (KL 0.016) for every build
+- **Part of it changes the output on purpose.** CPU/GPU expert parity shifts the output once (perplexity 4.425 -> 4.469) for every build
   that uses it and needs AVX-512. Its CPU replica copies the GPU expert kernels' arithmetic exactly, so every future
   change to those kernels would have to be checked against it again. That cost belongs in an opt-in fork, not in
   every upstream change.
 - **Upstream merges slowly compared with how much it receives.** On 2026-10-14 Strata had 525 open pull requests
   (the oldest from 2026-10-06) and 30 merged through GitHub in total, none in the past week, while 655 new ones were
-  opened. Exact-speed work goes stale quickly while it waits, since every upstream kernel change needs the KL checks
+  opened. Exact-speed work goes stale quickly while it waits, since every upstream kernel change needs the exactness checks
   again. A fork can ship it now and merge upstream on its own schedule. The decode kernels were opened as
   [PR #2231](https://github.com/Niko1221/Strata/pull/2231), later withdrawn; they live here instead.
 - **It is measured on one PC.** Upstream serves NVIDIA and AMD cards on Windows and Linux. Everything here was tuned
