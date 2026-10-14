@@ -2,7 +2,9 @@
 
 This branch (`rx7900xtx`) is upstream Strata plus speedups measured on one AMD Radeon RX 7900 XTX. Every change keeps
 the model's output **bit-identical**: teacher-forced KL against the engine without them is 0.0000, with the same top
-token at every position. Nothing here trades quality for speed.
+token at every position. Nothing here trades quality for speed. The one exception is opt-in and built separately:
+part 4 (`-DSTRATA_SWIGLU_SEXP` + `STRATA_CPU_PARITY=1`) shifts the output once against today's engine so that from then
+on it no longer depends on where the experts sit.
 
 Measured on: RX 7900 XTX 24 GB (gfx1100), Ryzen 7 9800X3D, 62 GiB RAM, Linux 7.2, ROCm 10.2 (TheRock nightly
 10.2.0a20260930), Qwen3.8-Flash-Next GSQ-RCO IQ3_S, 262,144-token context, no control vector.
@@ -86,7 +88,7 @@ through windows of **1, 2, 3, 4, 5, 6 and 8 tokens gives byte-identical log-prob
 the same 36 GDN layer states), so every token is exactly what one-token-at-a-time decoding would give: the reply no
 longer depends on the drafts or on timing. It can still change when the expert placement changes (how many experts fit
 in VRAM, which other programs' VRAM use can shift by a few slots), because an expert computed on the CPU differs from the
-GPU's result in the last bits; for the same placement it is the same. Checked with the debug knob `STRATA_READ_WINDOW=N` (read through windows of at most N tokens) and
+GPU's result in the last bits; for the same placement it is the same (part 4 removes that difference too). Checked with the debug knob `STRATA_READ_WINDOW=N` (read through windows of at most N tokens) and
 `kl.py`; end to end, a 2,425-token file rewrite returned byte-identical replies under four draft policies.
 
 That makes the draft policy a pure speed setting. On rewrite turns (the model returns a file with small edits):
@@ -103,6 +105,49 @@ questions, a coding task and a rewrite (slots pinned): `--spec 6` was fastest in
 beat 0.5. Ordinary chat and agent turns gain nothing from the lookup chain; `STRATA_IQ_MT_MIN` itself costs 0-5% there.
 The reference this matches is one-token decoding, not the engine without the switch (whose replies follow the drafts).
 
+### 4. The same output whatever the expert placement (`STRATA_CPU_PARITY=1`, build with `-DSTRATA_SWIGLU_SEXP`)
+
+Each routed expert runs either on the GPU (from VRAM or over PCIe) or on the CPU, and today the two give results that
+differ in the last bits. So the reply depends on the placement: how many expert slots fit in VRAM (other programs' VRAM
+use moves it by a few slots), the adaptive tier's swaps, and VRAM-saving options such as `--kv-resident`. On the same
+engine, moving 50 / 200 slots gives KL 0.0115 / 0.0176.
+
+This part makes the CPU compute exactly what the GPU computes:
+
+- **A portable exponential in the GPU SwiGLU** (`include/strata/kernels/sexp.hpp`, selected at build time with
+  `-DSTRATA_SWIGLU_SEXP`): a Cody-Waite `exp` from `fma` / `rint` / `ldexp` only, at most 0.94 ulp (`__expf` on
+  gfx1100: up to 64 ulp). `g / (1 + sexp(-g))` gives the same bits on the host and on the GPU for all 2^32 inputs.
+- **A CPU replica of the GPU expert arithmetic** (`src/kernels/cpu/replica_avx512.cpp`, AVX-512 VNNI): the same q8_1
+  activations, each part's integer dot and scale step, `(dw * d8) * sumi` accumulated by FMA (the GPU contracts it) in
+  the GPU's lane and butterfly order, for every format the model uses (gate/up IQ3_XXS, IQ3_S, IQ2_S, IQ4_XS; down
+  IQ4_NL, Q2_0). The tool `expert_replica` checks it against `native_expert_grouped`: 192/192 bit for bit (48 layers x
+  1-4 tokens, VRAM and PCIe launches); plain multiply + add, the negative control, differs everywhere.
+
+The switch turns itself off (and says why in the log) without AVX-512, if a layer's format is not in the replica, or on a
+GPU build without `-DSTRATA_SWIGLU_SEXP`. Without the switch nothing changes.
+
+Checked with kl.py (2,557 positions, slots pinned): with parity on, 7,200 slots against 7,150 / 7,000 / 6,500 slots
+gives KL 0.0000, 100% same top token, perplexity 4.447 at every placement (without parity: KL 0.0164). With
+`--kv-resident 32768` against without it, also KL 0.0000 and perplexity 4.447 = 4.447. Together with part 3 the reply
+no longer depends on the drafts, the timing, the expert placement or VRAM use.
+
+**The cost:** the new exponential rounds differently from `__expf`, a one-time shift against today's output: KL 0.0159,
+96.6% same top token, perplexity 4.425 -> 4.469, the same size as the placement drift above (perplexity 4.419-4.461).
+Tool calls: 36/36 valid with and without it.
+
+**The gain:** placement becomes a free speed setting, like the drafts in part 3. `--kv-resident 32768` keeps only the
+last 32K tokens of KV in VRAM and frees it for ~1,600 more expert slots (8,798 against ~7,200 here). Official benchmark,
+4 alternating rounds, medians:
+
+| Engine | Chat, writes answers | Agent session, writes answers | 16K prompt, reads |
+| --- | ---: | ---: | ---: |
+| Parts 1-3 | 95.4 tokens/s | 98.1 tokens/s | 1,852 tokens/s |
+| + parity | 94.6 tokens/s (-0.9%) | 98.5 tokens/s (+0.4%) | 1,857 tokens/s |
+| + parity + `--kv-resident 32768` | 94.8 tokens/s (-0.6%) | **105.8 tokens/s (+7.8%)** | 1,850 tokens/s |
+
+Parity alone costs nothing measurable. With `--kv-resident` every agent round (105.4-108.0) beat the best baseline round
+(103.7); chat decode was flat in this run (+4% in an earlier sweep).
+
 ## Use it
 
 Build the HIP engine for gfx1100 (the interleaved-copy path needs `-DSTRATA_HIP_MMVQ_IL`):
@@ -112,6 +157,8 @@ cmake -S . -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=
       "-DCMAKE_HIP_FLAGS=-DSTRATA_HIP_EXP_LAYOUTS -DSTRATA_HIP_MMVQ_IL"
 cmake --build build-hip --target strata
 ```
+
+For part 4 add `-DSTRATA_SWIGLU_SEXP` to `CMAKE_HIP_FLAGS` (a separate build directory keeps today's output available).
 
 Then add to the `env` of your `strata-*.json` (all bit-exact):
 
@@ -123,11 +170,13 @@ Then add to the `env` of your `strata-*.json` (all bit-exact):
 ```
 
 and, for deterministic decode with faster drafting, set its `args` to `--spec 6 --spec-min-p 0.5 --lookup-chain 3`.
+With the part 4 build, also `"STRATA_CPU_PARITY": "1"` in `env` and `--kv-resident 32768` in `args`.
 
 The log says whether it is on:
 
 ```
 strata prefill: STRATA_PF_GU_EXACT: the experts' gate/up products from 2 tokens, 16 experts a launch (checked bit for bit against rocBLAS at 25 token counts); from 65 tokens on the Tensile kernel
+strata generate: STRATA_CPU_PARITY: on (the CPU expert rows in the GPU's arithmetic, bit for bit)
 ```
 
 `STRATA_PF_GU_EXACT=G` sets the group size (1 = 16, at most 64; it borrows about 10 MB of VRAM per expert while a
@@ -141,3 +190,5 @@ prompt is read). `STRATA_PF_GU_TENSILE=0` keeps the 65+ token experts on gu_exac
   rocBLAS's order changes, the feature turns itself off.
 - Not built for CUDA or SYCL. The new code is HIP-only and compiles to stubs elsewhere.
 - Decode is unchanged by part 2; its gains are part 1's.
+- Part 4 needs AVX-512 (VNNI) on the CPU and was checked only for this model's formats. Its replica follows the GPU
+  kernels' order as built here; a change to those kernels needs the `expert_replica` check again.

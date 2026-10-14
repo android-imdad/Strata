@@ -34,7 +34,10 @@ How: faster decode kernels ([PR #2231](https://github.com/Niko1221/Strata/pull/2
 products computed in exactly rocBLAS's summation order, but grouped and on a Tensile-generated kernel for this card
 (`STRATA_PF_GU_EXACT=1`), about 2x faster for that step. With `STRATA_IQ_MT_MIN=1` decode is also **deterministic**:
 every token equals one-token-at-a-time decoding whatever the drafter guesses (for a given expert placement), so faster draft policies (prompt lookup
-for code rewrites, +8%) change only the speed. Details, flags and how it was checked:
+for code rewrites, +8%) change only the speed. An opt-in build (`-DSTRATA_SWIGLU_SEXP` + `STRATA_CPU_PARITY=1`) makes
+the CPU's expert rows bit-identical to the GPU's, so the output no longer depends on expert placement either; that
+shifts the output once (KL 0.016, perplexity 4.425 -> 4.469) and lets `--kv-resident 32768` free VRAM for agent
+sessions at KL 0 (+8% agent decode). Details, flags and how it was checked:
 **[docs/RX7900XTX.md](docs/RX7900XTX.md)**.
 
 ## How fast is it?
