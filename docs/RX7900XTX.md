@@ -34,7 +34,7 @@ faster and no longer identical to each other.
 
 ## What is in it
 
-### 1. Decode and prompt-path kernels (upstream PR #2231)
+### 1. Decode and prompt-path kernels (from PR #2231, withdrawn)
 
 [Niko1221/Strata#2231](https://github.com/Niko1221/Strata/pull/2231): launch shapes of latency-bound kernels (router,
 GDN norm, hyper-connection up, QSA top-k, the drafter's row select), DPP lane exchanges, the multi-block argmax on HIP,
@@ -183,6 +183,9 @@ strata generate: STRATA_CPU_PARITY: on (the CPU expert rows in the GPU's arithme
 prompt is read). `STRATA_PF_GU_TENSILE=0` keeps the 65+ token experts on gu_exact's own kernel.
 
 ## Limits
+
+Why this is a fork rather than an upstream pull request, and thanks to Strata: see the
+[README](../README.md#why-this-is-a-fork-and-not-merged-upstream).
 
 - Measured on one PC. The Tensile kernel is gfx1100 only; other cards keep gu_exact's own kernels, which follow
   rocBLAS's fallback order generally but were only checked here.

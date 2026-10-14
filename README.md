@@ -30,7 +30,7 @@ Linux, ROCm 10.2, IQ3_S, every output-changing switch off):
 | Reads a 32K prompt | 1,421 tokens/s | 1,844 tokens/s | **+30%** |
 | Agent turn, first token | 3.90 s | 2.92 s | **-25%** |
 
-How: faster decode kernels ([PR #2231](https://github.com/Niko1221/Strata/pull/2231)), and the prompt's expert
+How: faster decode kernels (first opened as [PR #2231](https://github.com/Niko1221/Strata/pull/2231)), and the prompt's expert
 products computed in exactly rocBLAS's summation order, but grouped and on a Tensile-generated kernel for this card
 (`STRATA_PF_GU_EXACT=1`), about 2x faster for that step. With `STRATA_IQ_MT_MIN=1` decode is also **deterministic**:
 every token equals one-token-at-a-time decoding whatever the drafter guesses (for a given expert placement), so faster draft policies (prompt lookup
@@ -39,6 +39,37 @@ the CPU's expert rows bit-identical to the GPU's, so the output no longer depend
 shifts the output once (KL 0.016, perplexity 4.425 -> 4.469) and lets `--kv-resident 32768` free VRAM for agent
 sessions at KL 0 (+8% agent decode). Details, flags and how it was checked:
 **[docs/RX7900XTX.md](docs/RX7900XTX.md)**.
+
+### Why this is a fork and not merged upstream
+
+- **The fastest part is specific to this card.** The prompt speedup comes from a Tensile-generated gfx1100 assembly
+  kernel, tuned and checked on one RX 7900 XTX with one ROCm build. On other GPUs it stays off, and its fallback
+  kernels were checked only here. It is bit-exact because it copies the summation order inside rocBLAS's fallback
+  kernels, and nothing guarantees that order: a ROCm update can change it (a check at start-up then turns the feature
+  off). Upstream would carry a kernel that its maintainers cannot test or regenerate without this card and a patched
+  Tensile setup.
+- **Part of it changes the output on purpose.** CPU/GPU expert parity shifts the output once (KL 0.016) for every build
+  that uses it and needs AVX-512. Its CPU replica copies the GPU expert kernels' arithmetic exactly, so every future
+  change to those kernels would have to be checked against it again. That cost belongs in an opt-in fork, not in
+  every upstream change.
+- **Upstream merges slowly compared with how much it receives.** On 2026-10-14 Strata had 525 open pull requests
+  (the oldest from 2026-10-06) and 30 merged through GitHub in total, none in the past week, while 655 new ones were
+  opened. Exact-speed work goes stale quickly while it waits, since every upstream kernel change needs the KL checks
+  again. A fork can ship it now and merge upstream on its own schedule. The decode kernels were opened as
+  [PR #2231](https://github.com/Niko1221/Strata/pull/2231), later withdrawn; they live here instead.
+- **It is measured on one PC.** Upstream serves NVIDIA and AMD cards on Windows and Linux. Everything here was tuned
+  and checked on a single RX 7900 XTX under Linux and ROCm 10.2, and it should be judged as that.
+
+This branch follows upstream and takes in its changes from time to time. Everything here is MIT licensed, like Strata,
+so upstream or anyone else is welcome to take any part of it.
+
+### Thanks
+
+To **[Niko](https://github.com/Niko1221)** and **[Strata](https://github.com/Niko1221/Strata)**. Strata is what makes a
+125-billion-parameter model usable on one gaming PC at all, and everything in this fork builds on it: the engine, the
+expert packs, the multi-token drafting and the official benchmark used for every number here. Deterministic
+decode is upstream's own `STRATA_IQ_MT_MIN` switch. Thanks also to Strata's contributors, and to AMD's ROCm, rocBLAS
+and Tensile, which generated the prompt kernel.
 
 ## How fast is it?
 
@@ -74,9 +105,6 @@ NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K pro
 [DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
 about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
 [community results](docs/COMMUNITY_BENCHMARKS.md).
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
 
 ## What you need
 
@@ -233,9 +261,3 @@ compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Nex
 and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
 [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
 parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
-
-## Support Strata
-
-Strata is free and open source. If it is useful to you, you can support its development:
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
