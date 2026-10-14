@@ -14,6 +14,7 @@
 #include "strata/platform/aux_cpus.hpp"
 
 #include "strata/core/layout.hpp"
+#include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -877,6 +878,7 @@ struct Prefill::Impl {
     uint16_t* dq_d[DQ_MAX] = {};
     bool gu_exact_ok = false;   // STRATA_PF_GU_EXACT passed its start-up check against Gemm::f16
     float* gu_exact_ws = nullptr;   // ... its 3-split partials (experts below 65 tokens)
+    float* snap_hist[2] = {};       // STRATA_PF_PIECE snapshots: a GDN layer's conv history (start, at the point)
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
@@ -2109,17 +2111,44 @@ const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::s
     if (!r) err = v.name(suffix) + " is missing";
     return r;
 }
+// STRATA_PF_PIECE=P (opt-in): a prompt chunk's dense products run in launches of at most P rows, at the row offsets a
+// chunk of P tokens would have.  The GEMM kernels' summation order depends on a row's tile index (StaggerU), so with
+// P = the chunk a reference run used, a larger chunk gives that run's projections bit for bit.
+int64_t pf_piece() {
+    static const int64_t p = [] { const char* v = std::getenv("STRATA_PF_PIECE"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
+    return p;
+}
+// the current chunk's offset in this run() call: a P-token reference reads a call's tokens in chunks of P from the
+// call's first token, so the pieces end at multiples of P counted from there
+int64_t g_pf_p0 = 0;
+// the rows [s0, s0 + n) of a chunk of T rows, piece by piece (one span when STRATA_PF_PIECE is off or T fits a piece)
+template <class F> void pf_spans(int64_t T, F&& f) {
+    const int64_t P = pf_piece();
+    if (P <= 0) { f((int64_t) 0, T); return; }
+    for (int64_t s0 = 0; s0 < T;) {
+        const int64_t n = std::min(T - s0, P - (g_pf_p0 + s0) % P);
+        f(s0, n);
+        s0 += n;
+    }
+}
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                  std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
-    gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
+    const int64_t sx = ldx > 0 ? ldx : w->ne0, sy = ldy > 0 ? ldy : w->ne1;
+    pf_spans(T, [&](int64_t s0, int64_t tp) {
+        gm.native(X + s0 * sx, w->native_type, w->native_data, Y + s0 * sy, tp, w->ne1, w->ne0, ldy, 0.0f, ldx);
+    });
     return true;
 }
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                std::string& err, int64_t ldy = 0, const uint16_t* X_lo = nullptr, int64_t ldx = 0) {
     if (w->kind != core::WeightKind::Bf16InF32 || !w->data) { err = "prefill: " + name + " is not a resident BF16 tensor"; return false; }
-    gm.bf16(X, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 0.0f, ldx);
-    if (X_lo) gm.bf16(X_lo, (const uint16_t*) w->data, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f);
+    const int64_t n = w->ne1 > 0 ? w->ne1 : 1;
+    const int64_t sx = ldx > w->ne0 ? ldx : w->ne0, sy = ldy > 0 ? ldy : n;
+    pf_spans(T, [&](int64_t s0, int64_t tp) {
+        gm.bf16(X + s0 * sx, (const uint16_t*) w->data, Y + s0 * sy, tp, n, w->ne0, ldy, 0.0f, ldx);
+        if (X_lo) gm.bf16(X_lo + s0 * w->ne0, (const uint16_t*) w->data, Y + s0 * sy, tp, n, w->ne0, ldy, 1.0f);
+    });
     return true;
 }
 
@@ -2308,6 +2337,35 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        g_pf_p0 = c0;
+        // STRATA_PF_PIECE: the inner piece ends where the caller wants a checkpoint (want_snapshot); the GDN recurrence,
+        // the indexer appends and the PLE history are taken there (the same state a chunk ending there leaves)
+        std::vector<int64_t> snap_b;
+        const size_t snap0 = snapshots_.size();
+        size_t snap_sbytes = 0, snap_conv_bytes = 0;
+        strata::core::ConversationStateSizes snap_z;
+        if (want_snapshot && pf_piece() > 0 && next_ == nullptr && !m.pp && LB == 0 && LE == g.n_layers &&
+            (!ple_on || ple_batch)) {
+            pf_spans(T, [&](int64_t s0, int64_t) { if (s0 > 0 && want_snapshot(p0 + s0)) snap_b.push_back(s0); });
+            if (!snap_b.empty()) {
+                std::string ze;
+                if (!strata::core::conversation_session_sizes(g, ss, snap_z, ze)) { err = "prefill: snapshot sizes: " + ze; return false; }
+                snap_sbytes = (size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size * 4;
+                snap_conv_bytes = (size_t) gdn_floats * 4 - snap_sbytes;
+                const size_t q = (size_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                for (const int64_t b : snap_b) {
+                    Snapshot sn;
+                    sn.pos = p0 + b;
+                    sn.gdn.resize(snap_z.gdn); sn.ple.resize(ss.ple_hist ? snap_z.ple : 0);
+                    sn.tails.resize(q * snap_z.tail); sn.dead.resize(q * snap_z.dead); sn.block_pos.resize(q * snap_z.block_pos);
+                    snapshots_.push_back(std::move(sn));
+                }
+                if (m.snap_hist[0] == nullptr) {
+                    for (float*& h : m.snap_hist)
+                        if (cudaMalloc((void**) &h, snap_conv_bytes) != cudaSuccess) { err = "prefill: snapshot buffer"; return false; }
+                }
+            }
+        }
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
@@ -2714,6 +2772,31 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fprintf(stderr, "strata pf-step: chunk from token %lld, layer %lld: %s took %.0f ms (%s / %s)\n",
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };
+        // debug (STRATA_PF_LAYER_DUMP=<file>): an FNV-1a hash of the residual rows at every 64th position, at the start of
+        // each half layer (tag = 2 * layer + half; 2 * n_layers = after the last layer) - where two chunkings part
+        const auto pf_buf_dump = [&](int64_t tag, const void* base, int64_t row_bytes, int64_t stride_bytes) {
+            static const char* path = std::getenv("STRATA_PF_LAYER_DUMP");
+            if (path == nullptr) return;
+            cudaStreamSynchronize(m.cs);
+            static const int64_t every_env = [] { const char* v = std::getenv("STRATA_PF_DUMP_EVERY"); return v ? (int64_t) std::atoll(v) : (int64_t) 64; }();
+            const int64_t ev = every_env > 0 ? every_env : 64;
+            const int64_t t0 = (ev - p0 % ev) % ev;
+            if (t0 >= T) return;
+            const int64_t rows = (T - t0 + ev - 1) / ev;
+            std::vector<unsigned char> buf((size_t) row_bytes);
+            if (std::FILE* f = std::fopen(path, "ab")) {
+                for (int64_t r = 0; r < rows; ++r) {
+                    cudaMemcpy(buf.data(), (const unsigned char*) base + (t0 + r * ev) * stride_bytes, (size_t) row_bytes,
+                               cudaMemcpyDeviceToHost);
+                    uint64_t h = 1469598103934665603ull;
+                    for (int64_t i = 0; i < row_bytes; ++i) { h ^= buf[(size_t) i]; h *= 1099511628211ull; }
+                    const int64_t rec[3] = {p0 + t0 + r * ev, tag, (int64_t) h};
+                    std::fwrite(rec, sizeof rec, 1, f);
+                }
+                std::fclose(f);
+            }
+        };
+        const auto pf_layer_dump = [&](int64_t tag) { pf_buf_dump(tag, m.R, D * 4, D * 4); };
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
@@ -2731,8 +2814,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 constexpr int64_t HD = strata::kernels::NG_HC_DIM;
                 const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2(m.f16_io) ? 4 : 2) + 4096;
                 const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
-                for (int64_t s0 = 0; s0 < T; s0 += SB) {
-                    const int64_t nb = std::min(SB, T - s0);
+                std::vector<std::pair<int64_t, int64_t>> sbs;   // STRATA_PF_PIECE: the sub-batches inside the pieces
+                pf_spans(T, [&](int64_t a0, int64_t an) { for (int64_t b = a0; b < a0 + an; b += SB) sbs.emplace_back(b, std::min(SB, a0 + an - b)); });
+                for (const auto& sb : sbs) {
+                    const int64_t s0 = sb.first, nb = sb.second;
                     uint8_t* q = m.region;
                     auto carve_f = [&](size_t n) { float* p = (float*) q; q += (n * 4 + 255) & ~(size_t) 255; return p; };
                     float* key = carve_f((size_t) nb * HD);
@@ -2757,6 +2842,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     try {
                         strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
                                                                   gate, (int) nb, m.cs);
+                        for (size_t k = 0; k < snap_b.size(); ++k)
+                            if (snap_b[k] == s0 + nb && ss.ple_hist)
+                                cudaMemcpyAsync(snapshots_[snap0 + k].ple.data(), ss.ple_hist, snap_z.ple, cudaMemcpyDeviceToHost, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                 }
                 stats_.ms_ple += ms_since(tp);
@@ -2776,6 +2864,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 stats_.ms_ple += ms_since(tp);
             }
             for (int half = 0; half < 2; ++half) {
+                pf_layer_dump(l * 2 + half);
                 // ---- the hyper-connection read of this half
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
                 const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
@@ -2803,7 +2892,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 bool hdown = false;
                 if (ldx != D && !pf_hcdown()) {   // STRATA_HCD_EXACT: the exact-order down kernel when hipBLASLt would take 1176 / 1177
                     hdown = wd->kind == core::WeightKind::Bf16InF32 && wd->data && wd->ne0 == D && wd->ne1 == LR &&
-                            m.gemm.bf16_hcd_exact(m.xn16, ldx, (const uint16_t*) wd->data, m.lo, T, LR, D);
+                            [&] {   // STRATA_PF_PIECE: per piece; a piece the exact kernel does not take runs bf16()
+                                bool first = true, ok = true;
+                                pf_spans(T, [&](int64_t s0, int64_t tp) {
+                                    if (!ok) return;
+                                    const bool ex = m.gemm.bf16_hcd_exact(m.xn16 + s0 * ldx, ldx, (const uint16_t*) wd->data,
+                                                                          m.lo + s0 * LR, tp, LR, D);
+                                    if (first && !ex) { ok = false; return; }
+                                    first = false;
+                                    if (!ex) m.gemm.bf16(m.xn16 + s0 * ldx, (const uint16_t*) wd->data, m.lo + s0 * LR, tp, LR, D,
+                                                         0, 0.0f, ldx);
+                                });
+                                return ok;
+                            }();
                 } else if (ldx != D) {
                     if (wd->kind != core::WeightKind::Bf16InF32 || !wd->data || wd->ne0 != D || wd->ne1 != LR ||
                         wi->kind != core::WeightKind::Bf16InF32 || !wi->data || wi->ne0 != D || wi->ne1 != HC ||
@@ -2868,17 +2969,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                    const size_t goff = (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats * 4;
+                    if (!snap_b.empty())   // the chunk's starting history, for the history at each snapshot point
+                        cudaMemcpyAsync(m.snap_hist[0], conv, snap_conv_bytes, cudaMemcpyDeviceToDevice, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+                    for (size_t k = 0; k < snap_b.size(); ++k) {
+                        cudaMemcpyAsync(m.snap_hist[1], m.snap_hist[0], snap_conv_bytes, cudaMemcpyDeviceToDevice, m.cs);
+                        gdn_conv_history_at(m.snap_hist[1], m.qkv, snap_b[k], m.cs);
+                        cudaMemcpyAsync(snapshots_[snap0 + k].gdn.data() + goff + snap_sbytes, m.snap_hist[1], snap_conv_bytes,
+                                        cudaMemcpyDeviceToHost, m.cs);
+                    }
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
-                                   ld_y);
+                    // in segments at the snapshot points (the recurrence is sequential: the same bits as one launch)
+                    for (size_t k = 0, prev = 0; k <= snap_b.size(); ++k) {
+                        const int64_t b = k < snap_b.size() ? snap_b[k] : T, a = (int64_t) prev;
+                        gdn_recurrence(state, m.hbuf + a * C, m.gate + a * HV, m.beta + a * HV, m.z + a * ZV,
+                                       (const float*) wnm->data, EPS, m.y + a * ZV, m.y_h + a * (ld_y > 0 ? ld_y : ZV), b - a,
+                                       m.cs, ld_y);
+                        if (k < snap_b.size())
+                            cudaMemcpyAsync(snapshots_[snap0 + k].gdn.data() + goff, state, snap_sbytes, cudaMemcpyDeviceToHost, m.cs);
+                        prev = (size_t) b;
+                    }
                     pt.mark(kPfGdnOut, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
                     ++gdn_index;
@@ -2975,10 +3093,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
                     try {
                         static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
-                        if (!per_token) {
-                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
-                                                                             EPS, ib, s, st.max_cells,
-                                                                             strata::kernels::rope_scaling(), m.cs);
+                        if (!per_token) {   // (in segments at the snapshot points: the same end state)
+                            for (size_t k = 0, prev = 0; k <= snap_b.size(); ++k) {
+                                const int64_t b = k < snap_b.size() ? snap_b[k] : T, a = (int64_t) prev;
+                                strata::kernels::native_qsa_indexer_append_batch(m.idx_raw + a * 128, b - a, p0 + a, 0,
+                                                                                 (const float*) wikn->data, EPS, ib, s,
+                                                                                 st.max_cells, strata::kernels::rope_scaling(), m.cs);
+                                if (k < snap_b.size()) {
+                                    auto& sn = snapshots_[snap0 + k];
+                                    const size_t j = (size_t) (qsa_index - ss.qsa_ord0);
+                                    cudaMemcpyAsync(sn.tails.data() + j * snap_z.tail, st.idx_tail, snap_z.tail, cudaMemcpyDeviceToHost, m.cs);
+                                    cudaMemcpyAsync(sn.dead.data() + j * snap_z.dead, st.idx_dead, snap_z.dead, cudaMemcpyDeviceToHost, m.cs);
+                                    cudaMemcpyAsync(sn.block_pos.data() + j * snap_z.block_pos, st.idx_block_pos, snap_z.block_pos,
+                                                    cudaMemcpyDeviceToHost, m.cs);
+                                }
+                                prev = (size_t) b;
+                            }
                         }
                         for (int64_t t = 0; per_token && t < T; ++t) {
                             const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
@@ -3191,7 +3321,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
-                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                        pf_spans(T, [&](int64_t s0, int64_t tp) {
+                            m.gemm.bf16(m.mixed_bf + s0 * N, (const uint16_t*) wgi->data, m.sg + s0, tp, 1, N);
+                        });
                         if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
                         return true;
                     };
@@ -4070,11 +4202,27 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         GuExactGroup gx;
                         int64_t gx_o0[kGuExactMax] = {};
                         int gx_q[kGuExactMax] = {};
+                        int gx_nbuf = 0;   // STRATA_PF_PIECE: the experts (dequantized buffers) the group's entries use
+                        // STRATA_PF_PIECE: the down products of the group's pieces, one per piece (a gate/up entry can
+                        // cover several pieces, the down product's order follows its token count)
+                        std::vector<int64_t> dn_o0, dn_n;
+                        std::vector<int> dn_q;
                         auto gx_flush = [&]() {
+                            gx_nbuf = 0;
                             if (gx.n == 0) return;
                             pt.mark(kPfGemmGU, cs);
                             if (!gu_exact_run(gx, m.gu_exact_ws, m.cs))   // (a failed launch: the same products, one call each)
                                 for (int i = 0; i < gx.n; ++i) m.gemm.f16(gx.x[i], gx.w[i], gx.y[i], gx.t[i], 1280, N);
+                            if (!dn_n.empty()) {
+                                for (int i = 0; i < gx.n; ++i)
+                                    swiglu_interleaved(m.GU + gx_o0[i] * 1280, m.Hh + gx_o0[i] * 640, gx.t[i], m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                for (size_t i = 0; i < dn_n.size(); ++i)
+                                    m.gemm.f16(m.Hh + dn_o0[i] * 640, m.dq_d[dn_q[i]], m.Dm + dn_o0[i] * N, dn_n[i], N, 640);
+                                dn_o0.clear(); dn_n.clear(); dn_q.clear();
+                                gx.n = 0;
+                                return;
+                            }
                             for (int i = 0; i < gx.n; ++i) {
                                 const int64_t o0 = gx_o0[i], ne = gx.t[i];
                                 swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
@@ -4082,6 +4230,79 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.gemm.f16(m.Hh + o0 * 640, m.dq_d[gx_q[i]], m.Dm + o0 * N, ne, N, 640);
                             }
                             gx.n = 0;
+                        };
+                        // STRATA_PF_PIECE: an expert's rows are in token order, so a piece's rows are contiguous.  The
+                        // expert is dequantized once and each piece's rows take exactly the calls a chunk of the piece's
+                        // size makes (the same token count -> the same GEMM order class), so the bits are that chunking's.
+                        auto compute_pieces = [&](size_t j, const uint8_t* blob_dev, int slot, int64_t o0, int64_t ne) -> bool {
+                            const int64_t P = pf_piece();
+                            static const int64_t gx_min = [] { const char* v = std::getenv("STRATA_PF_GU_EXACT_MINT"); return v ? (int64_t) std::atoll(v) : kGuExactMinT; }();
+                            int64_t po[64], pn[64];
+                            int np = 0;
+                            for (int64_t r = 0; r < ne;) {
+                                const int64_t pc = (g_pf_p0 + src_h[(size_t) (o0 + r)]) / P;
+                                int64_t r1 = r + 1;
+                                while (r1 < ne && (g_pf_p0 + src_h[(size_t) (o0 + r1)]) / P == pc) ++r1;
+                                if (np == 64) { err = "prefill: STRATA_PF_PIECE: more than 64 pieces in a chunk"; return false; }
+                                po[np] = o0 + r; pn[np] = r1 - r; ++np;
+                                r = r1;
+                            }
+                            bool dfr[64];
+                            for (int i = 0; i < np; ++i)
+                                dfr[i] = m.gu_exact_ok && N == 2560 && pn[i] >= std::max(gx_min, kGuExactMinT) &&
+                                         pn[i] <= kGuExactMaxT && m.gemm.f16_on_rocblas(pn[i], 1280, N);
+                            // gate/up entries: consecutive deferred pieces of 65+ tokens merge into one (that kernel's
+                            // order depends only on the output column, not on the token count or a row's place);
+                            // STRATA_PF_PIECE_MERGE=0 keeps one entry per piece
+                            static const bool merge = [] { const char* v = std::getenv("STRATA_PF_PIECE_MERGE"); return v == nullptr || std::atoi(v) != 0; }();
+                            int64_t eo[64], en[64];
+                            int nd = 0;
+                            for (int i = 0; i < np; ++i) {
+                                if (!dfr[i]) continue;
+                                const bool big = pn[i] >= kGuExactSplitT;
+                                if (merge && big && nd > 0 && en[nd - 1] >= kGuExactSplitT && eo[nd - 1] + en[nd - 1] == po[i] &&
+                                    en[nd - 1] + pn[i] <= kGuExactMaxT && i > 0 && dfr[i - 1] && pn[i - 1] >= kGuExactSplitT) {
+                                    en[nd - 1] += pn[i];
+                                    continue;
+                                }
+                                eo[nd] = po[i]; en[nd] = pn[i]; ++nd;
+                            }
+                            // at most gu_exact_group() entries a launch, as without pieces (m.gu_exact_ws holds that many)
+                            if (nd > gu_exact_group()) { err = "prefill: STRATA_PF_PIECE: more pieces than a GU_EXACT group"; return false; }
+                            if (nd > 0 && gx.n + nd > gu_exact_group()) gx_flush();
+                            const int q = nd > 0 ? DQ + gx_nbuf++ : (int) (j % DQ);
+                            pt.mark(kPfDequant, cs);
+                            if (lay.native) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                   m.dq_gu[q], m.cs);
+                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                            } else {
+                                blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
+                            }
+                            if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; m.used_bid[slot] = 0; }
+                            for (int i = 0; i < nd; ++i) {
+                                gx.x[gx.n] = m.Xs + eo[i] * N;
+                                gx.w[gx.n] = m.dq_gu[q];
+                                gx.y[gx.n] = m.GU + eo[i] * 1280;
+                                gx.t[gx.n] = (int) en[i];
+                                gx_o0[gx.n] = eo[i];
+                                gx_q[gx.n] = q;
+                                ++gx.n;
+                            }
+                            for (int i = 0; i < np; ++i) {
+                                if (dfr[i]) {
+                                    dn_o0.push_back(po[i]); dn_n.push_back(pn[i]); dn_q.push_back(q);
+                                    continue;
+                                }
+                                pt.mark(kPfGemmGU, cs);
+                                m.gemm.f16(m.Xs + po[i] * N, m.dq_gu[q], m.GU + po[i] * 1280, pn[i], 1280, N);
+                                swiglu_interleaved(m.GU + po[i] * 1280, m.Hh + po[i] * 640, pn[i], m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                m.gemm.f16(m.Hh + po[i] * 640, m.dq_d[q], m.Dm + po[i] * N, pn[i], N, 640);
+                            }
+                            if (gx.n == gu_exact_group()) gx_flush();
+                            return true;
                         };
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                             const int32_t e = order[j];
@@ -4146,6 +4367,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return true;
                             }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
+                            if (pf_piece() > 0 && !m.pp && on_cpu.empty())
+                                return compute_pieces(j, blob_dev, slot, o0, ne);
                             static const int64_t gx_min = [] { const char* v = std::getenv("STRATA_PF_GU_EXACT_MINT"); return v ? (int64_t) std::atoll(v) : kGuExactMinT; }();   // (debug)
                             const bool defer = m.gu_exact_ok && N == 2560 && ne >= std::max(gx_min, kGuExactMinT) && ne <= kGuExactMaxT &&
                                                m.gemm.f16_on_rocblas(ne, 1280, N);
@@ -4408,6 +4631,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             hand_buf_ ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
+        pf_layer_dump(2 * (int64_t) g.n_layers);
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
             cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
             if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {

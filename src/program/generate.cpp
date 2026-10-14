@@ -8490,6 +8490,12 @@ int main(int argc, char** argv) {
                     c.stage_parts.push_back(std::move(part));
                 }
             }
+            if (std::getenv("STRATA_CKPT_HASH")) {   // debug: the saved state's hash, to compare two chunkings
+                auto fnv = [](const std::vector<uint8_t>& v) { uint64_t h = 1469598103934665603ull; for (uint8_t x : v) { h ^= x; h *= 1099511628211ull; } return h; };
+                std::fprintf(stderr, "strata serve: checkpoint %lld%s: gdn %016llx ple %016llx tails %016llx dead %016llx pos %016llx\n",
+                             (long long) L, parts ? " (snapshot)" : "", (unsigned long long) fnv(c.gdn), (unsigned long long) fnv(c.ple),
+                             (unsigned long long) fnv(c.tails), (unsigned long long) fnv(c.dead), (unsigned long long) fnv(c.block_pos));
+            }
             c.used = ++check_clock;
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
@@ -8530,7 +8536,22 @@ int main(int argc, char** argv) {
         // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
         static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
+        // STRATA_PF_PIECE: a periodic checkpoint at a piece end inside a larger chunk, where a chunk of the piece's size
+        // would have ended - the same positions and the same state as with those chunks (Prefill::want_snapshot)
+        sp.want_snapshot = nullptr;
+        if (!multi_gpu && o.prompt_cache > 0 && o.prompt_cache_every > 0)
+            sp.want_snapshot = [&](int64_t pos) -> bool {
+                if (pos < pp_next_check) return false;
+                pp_next_check = pos + o.prompt_cache_every;
+                return true;
+            };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+            for (strata::prefill::Prefill::Snapshot& sn : sp.take_snapshots()) {
+                std::vector<ConvCheckpoint> parts(1);
+                parts[0].gdn = std::move(sn.gdn); parts[0].ple = std::move(sn.ple); parts[0].tails = std::move(sn.tails);
+                parts[0].dead = std::move(sn.dead); parts[0].block_pos = std::move(sn.block_pos);
+                if (!checkpoint_at(sn.pos, &parts)) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
+            }
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)

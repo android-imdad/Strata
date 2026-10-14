@@ -99,6 +99,10 @@ and to `args`, for deterministic decode with faster drafting:
 With the parity build, also add `"STRATA_CPU_PARITY": "1"` to `env` and `"--kv-resident", "32768"` to `args`
 (+8% decode in agent sessions).
 
+Faster long prompts with the same output: add `"STRATA_PF_PIECE": "8192"` to `env` and change `"--prefill", "auto"` to
+`"--prefill", "auto:32768"` in `args`. Prompts are read in 32K chunks but computed exactly as 8K chunks, so the output
+and the conversation checkpoints are bit-identical: a fresh 32K prompt +13-16%, long documents +10-12%.
+
 The engine's log (`strata-<model>.log`) shows that they are on:
 
 ```
@@ -111,25 +115,30 @@ switch, how each one was checked and its limits: **[docs/RX7900XTX.md](docs/RX79
 
 ## More speed, if you accept a small change in output
 
-The settings above are all exact. The switches below are faster but change the output slightly, so it is no longer
-bit-identical to upstream. Perplexity (lower is better) is measured over 2,557 positions of code and docs after 16K,
-16K and 64K prompts. For scale: before the parity build, a shift of only 200 expert slots in VRAM moved the same
-engine's perplexity between 4.419 and 4.461, so changes of a few hundredths are within that range.
+The settings above are all exact. The switches below change the output slightly, so it is no longer bit-identical to
+upstream. Each was turned on alone against the exact setup (parity build, `--kv-resident 32768`, the expert cache
+pinned at 8,600 slots): perplexity over 2,557 positions of code and docs after 16K, 16K and 64K prompts (lower is
+better; the exact setup scores **4.447**), and prompt reading speed from the same runs (one run each, so about +/-3%).
+For scale: before the parity build, shifting only 200 expert slots moved perplexity between 4.419 and 4.461.
 
-| Switch | What it does | Perplexity, without -> with | Speed |
-| --- | --- | ---: | --- |
-| `STRATA_HC_Q8=1` + `STRATA_HC_Q8_BF16=1` (`env`) | decode reads the hyper-connection weights as 8-bit | 4.486 -> 4.488 | decode +5.5% |
-| `STRATA_HIP_WMMA=1` + `STRATA_SELECT_WMMA=1` + `STRATA_PA_FAST=1` (`env`) | prompt attention on the matrix cores | 4.455 -> 4.460 | prompts +15% (4K) to +41% (128K) |
-| `STRATA_PF_GEMM=1` (`env`) | faster prompt-path GEMMs | 4.486 -> 4.506 | prompts |
-| `STRATA_PF_FUSED=1` (`env`) | fused prompt-path kernels | 4.486 -> 4.455 | prompts |
-| `STRATA_HC_UPMIX=1` (`env`) | fused hyper-connection up + mix in prompts | 4.486 -> 4.533 | prompts |
-| `STRATA_PREFILL_CPU_SHARE=auto` (`env`) | the CPU takes some experts of short prompt chunks | 4.461 -> 4.470 | agent tool-result reads (200-1,000 tokens) -34% to -54% time |
-| `--prefill auto:32768` (`args`) | 32K prompt chunks instead of 8K | 4.486 -> 4.492 | prompts of 32K and longer |
+| Switch | Perplexity | Same top token | 16K prompt read | 48K prompt read |
+| --- | ---: | ---: | ---: | ---: |
+| exact (the settings above) | 4.447 | 100% | - | - |
+| `--prefill auto:32768` (`args`): 32K prompt chunks instead of 8K (with `STRATA_PF_PIECE=8192`: 4.447, exact, about half the gain) | 4.469 | 96.2% | **+13%** | **+21%** |
+| `STRATA_HIP_WMMA=1` + `STRATA_SELECT_WMMA=1` + `STRATA_PA_FAST=1` (`env`): prompt attention on the matrix cores | 4.492 | 95.9% | **+11%** | **+16%** |
+| `STRATA_HC_UPMIX=1` + `STRATA_PF_SWITCH_MIN_T=4096` (`env`) | 4.501 | 94.7% | +2% | -1% |
+| `STRATA_PF_GEMM=1` + `STRATA_PF_SWITCH_MIN_T=4096` (`env`) | 4.508 | 94.2% | **-21%** | **-21%** |
 
-Together, `HC_Q8`, `PF_GEMM`, `PF_FUSED`, `HC_UPMIX` and 32K chunks were worth +9% decode and +7% (1K) to +22% (128K)
-on prompts. These numbers come from an earlier engine of this fork, before `STRATA_PF_GU_EXACT` and the parity build.
-Their gain on top of the current exact settings has not been measured again, so run `./bench.sh` with and without
-them. Each switch is a single `env` or `args` entry; remove it to go back to exact output.
+- **`--prefill auto:32768`** is the best trade: the smallest change in perplexity and the largest gain on long prompts.
+  Prompt attention on the matrix cores (WMMA) is next. Both speed up reading prompts only; writing answers is unchanged.
+- **Do not use `STRATA_PF_GEMM`** on this fork: it takes the experts' products off rocBLAS, which turns
+  `STRATA_PF_GU_EXACT` off (the log says so), and the prompt path ends up 21% slower. All the switches together
+  (perplexity 4.502) were slower than `--prefill auto:32768` alone for the same reason.
+- **No effect here:** `STRATA_HC_Q8` converts nothing on this build (the log reports 0.00 GiB), and `STRATA_PF_FUSED`
+  changed neither the output nor the speed. `STRATA_PREFILL_CPU_SHARE=auto` acts only on short prompt chunks (agent
+  tool results), which this test does not read, so it is not measured here.
+
+Each switch is a single `env` or `args` entry; remove it to go back to exact output.
 
 Never set `STRATA_FUSE_HEAD_GR=1`. On this card it breaks the model (perplexity 15).
 
