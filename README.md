@@ -119,6 +119,9 @@ Start it with `./setup.sh` as usual. The app opens at `http://127.0.0.1:8080`, a
 To measure your own card, run `./bench.sh` (5-10 minutes: chat, 4K / 16K prompts and an agent-style session). The
 numbers above come from this benchmark.
 
+Problems with this fork's changes: open an [issue here](https://github.com/android-imdad/Strata-7900xtx/issues). For
+everything else, see [upstream's issues](https://github.com/Niko1221/Strata/issues).
+
 ## Why a fork and not merged upstream
 
 - **The fastest part is specific to this card.** The prompt speedup comes from a Tensile-generated gfx1100 assembly
